@@ -14,8 +14,9 @@ use core::{
 use futures::{future::Either, FutureExt, TryFutureExt};
 use reth_errors::RethResult;
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::{EngineApiMessageVersion, PayloadTypes};
+use reth_payload_primitives::{EngineApiMessageVersion, PayloadAttributes, PayloadTypes};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tracing::debug;
 
 /// Type alias for backwards compat
 #[deprecated(note = "Use ConsensusEngineHandle instead")]
@@ -232,12 +233,17 @@ where
         payload_attrs: Option<Payload::PayloadAttributes>,
         version: EngineApiMessageVersion,
     ) -> Result<ForkchoiceUpdated, BeaconForkChoiceUpdateError> {
-        Ok(self
-            .send_fork_choice_updated(state, payload_attrs, version)
-            .map_err(|_| BeaconForkChoiceUpdateError::EngineUnavailable)
-            .await?
-            .map_err(BeaconForkChoiceUpdateError::internal)?
-            .await?)
+        Ok({
+            let payload_timestamp = payload_attrs.as_ref().map(|attrs| attrs.timestamp());
+            let await_result = self
+                .send_fork_choice_updated(state, payload_attrs, version)
+                .map_err(|_| BeaconForkChoiceUpdateError::EngineUnavailable)
+                .await?;
+            debug!(target: "engine::primitives", ?payload_timestamp, "Awaiting forkchoice updated result");
+            let await_fut = await_result.map_err(BeaconForkChoiceUpdateError::internal)?.await?;
+            debug!(target: "engine::primitives", ?payload_timestamp, payload_id = ?await_fut.payload_id, "Forkchoice updated result awaited");
+            await_fut
+        })
     }
 
     /// Sends a forkchoice update message to the beacon consensus engine and returns the receiver to

@@ -24,7 +24,7 @@ use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use std::time::Instant;
 use tokio::sync::oneshot;
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// The state of the persistence task.
 #[derive(Default, Debug)]
@@ -78,7 +78,7 @@ impl PersistenceState {
         last_persisted_block_hash: B256,
         last_persisted_block_number: u64,
     ) {
-        trace!(target: "engine::tree", block= %last_persisted_block_number, hash=%last_persisted_block_hash, "updating persistence state");
+        debug!(target: "engine::tree", block= %last_persisted_block_number, hash=%last_persisted_block_hash, "updating persistence state");
         self.rx = None;
         self.last_persisted_block =
             BlockNumHash::new(last_persisted_block_number, last_persisted_block_hash);

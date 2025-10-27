@@ -1,7 +1,7 @@
 //! Contains [Chain], a chain of blocks and their final state.
 
 use crate::ExecutionOutcome;
-use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeMap, sync::Arc, vec::Vec};
 use alloy_consensus::{transaction::Recovered, BlockHeader};
 use alloy_eips::{eip1898::ForkBlock, eip2718::Encodable2718, BlockNumHash};
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash};
@@ -26,15 +26,15 @@ use revm::database::BundleState;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Chain<N: NodePrimitives = reth_ethereum_primitives::EthPrimitives> {
-    /// All blocks in this chain.
-    blocks: BTreeMap<BlockNumber, RecoveredBlock<N::Block>>,
-    /// The outcome of block execution for this chain.
+    /// All blocks in this chain, stored as Arc for efficient sharing.
+    blocks: BTreeMap<BlockNumber, Arc<RecoveredBlock<N::Block>>>,
+    /// The outcome of block execution for this chain, stored as Arc for efficient sharing.
     ///
     /// This field contains the state of all accounts after the execution of all blocks in this
     /// chain, ranging from the [`Chain::first`] block to the [`Chain::tip`] block, inclusive.
     ///
     /// Additionally, it includes the individual state changes that led to the current state.
-    execution_outcome: ExecutionOutcome<N::Receipt>,
+    execution_outcome: Arc<ExecutionOutcome<N::Receipt>>,
     /// State trie updates after block is added to the chain.
     /// NOTE: Currently, trie updates are present only for
     /// single-block chains that extend the canonical chain.
@@ -62,8 +62,62 @@ impl<N: NodePrimitives> Chain<N> {
         execution_outcome: ExecutionOutcome<N::Receipt>,
         trie_updates: Option<TrieUpdates>,
     ) -> Self {
-        let blocks =
-            blocks.into_iter().map(|b| (b.header().number(), b)).collect::<BTreeMap<_, _>>();
+        let blocks = blocks
+            .into_iter()
+            .map(|b| {
+                let num = b.header().number();
+                (num, Arc::new(b))
+            })
+            .collect::<BTreeMap<_, _>>();
+        debug_assert!(!blocks.is_empty(), "Chain should have at least one block");
+
+        Self { blocks, execution_outcome: Arc::new(execution_outcome), trie_updates }
+    }
+
+    /// Create new Chain from Arc-wrapped blocks and state.
+    ///
+    /// This is more efficient when blocks are already Arc-wrapped as it avoids cloning.
+    ///
+    /// # Warning
+    ///
+    /// A chain of blocks should not be empty.
+    pub fn from_arc_blocks(
+        blocks: impl IntoIterator<Item = Arc<RecoveredBlock<N::Block>>>,
+        execution_outcome: ExecutionOutcome<N::Receipt>,
+        trie_updates: Option<TrieUpdates>,
+    ) -> Self {
+        let blocks = blocks
+            .into_iter()
+            .map(|b| {
+                let num = b.header().number();
+                (num, b)
+            })
+            .collect::<BTreeMap<_, _>>();
+        debug_assert!(!blocks.is_empty(), "Chain should have at least one block");
+
+        Self { blocks, execution_outcome: Arc::new(execution_outcome), trie_updates }
+    }
+
+    /// Create new Chain from Arc-wrapped blocks and Arc-wrapped execution outcome.
+    ///
+    /// This is the most efficient constructor when both blocks and execution outcome
+    /// are already Arc-wrapped, avoiding all cloning.
+    ///
+    /// # Warning
+    ///
+    /// A chain of blocks should not be empty.
+    pub fn from_arc(
+        blocks: impl IntoIterator<Item = Arc<RecoveredBlock<N::Block>>>,
+        execution_outcome: Arc<ExecutionOutcome<N::Receipt>>,
+        trie_updates: Option<TrieUpdates>,
+    ) -> Self {
+        let blocks = blocks
+            .into_iter()
+            .map(|b| {
+                let num = b.header().number();
+                (num, b)
+            })
+            .collect::<BTreeMap<_, _>>();
         debug_assert!(!blocks.is_empty(), "Chain should have at least one block");
 
         Self { blocks, execution_outcome, trie_updates }
@@ -79,12 +133,12 @@ impl<N: NodePrimitives> Chain<N> {
     }
 
     /// Get the blocks in this chain.
-    pub const fn blocks(&self) -> &BTreeMap<BlockNumber, RecoveredBlock<N::Block>> {
+    pub const fn blocks(&self) -> &BTreeMap<BlockNumber, Arc<RecoveredBlock<N::Block>>> {
         &self.blocks
     }
 
     /// Consumes the type and only returns the blocks in this chain.
-    pub fn into_blocks(self) -> BTreeMap<BlockNumber, RecoveredBlock<N::Block>> {
+    pub fn into_blocks(self) -> BTreeMap<BlockNumber, Arc<RecoveredBlock<N::Block>>> {
         self.blocks
     }
 
@@ -104,18 +158,23 @@ impl<N: NodePrimitives> Chain<N> {
     }
 
     /// Get execution outcome of this chain
-    pub const fn execution_outcome(&self) -> &ExecutionOutcome<N::Receipt> {
+    pub fn execution_outcome(&self) -> &ExecutionOutcome<N::Receipt> {
         &self.execution_outcome
     }
 
-    /// Get mutable execution outcome of this chain
-    pub const fn execution_outcome_mut(&mut self) -> &mut ExecutionOutcome<N::Receipt> {
-        &mut self.execution_outcome
+    /// Get the Arc-wrapped execution outcome of this chain for efficient cloning
+    pub fn execution_outcome_arc(&self) -> &Arc<ExecutionOutcome<N::Receipt>> {
+        &self.execution_outcome
+    }
+
+    /// Get mutable access to execution outcome (requires making it unique if Arc has multiple refs)
+    pub fn execution_outcome_mut(&mut self) -> &mut ExecutionOutcome<N::Receipt> {
+        Arc::make_mut(&mut self.execution_outcome)
     }
 
     /// Prepends the given state to the current state.
     pub fn prepend_state(&mut self, state: BundleState) {
-        self.execution_outcome.prepend_state(state);
+        Arc::make_mut(&mut self.execution_outcome).prepend_state(state);
         self.trie_updates.take(); // invalidate cached trie updates
     }
 
@@ -131,7 +190,9 @@ impl<N: NodePrimitives> Chain<N> {
 
     /// Returns the block with matching hash.
     pub fn recovered_block(&self, block_hash: BlockHash) -> Option<&RecoveredBlock<N::Block>> {
-        self.blocks.iter().find_map(|(_num, block)| (block.hash() == block_hash).then_some(block))
+        self.blocks
+            .iter()
+            .find_map(|(_num, block)| (block.hash() == block_hash).then_some(block.as_ref()))
     }
 
     /// Return execution outcome at the `block_number` or None if block is not known
@@ -140,13 +201,13 @@ impl<N: NodePrimitives> Chain<N> {
         block_number: BlockNumber,
     ) -> Option<ExecutionOutcome<N::Receipt>> {
         if self.tip().number() == block_number {
-            return Some(self.execution_outcome.clone())
+            return Some(Arc::unwrap_or_clone(Arc::clone(&self.execution_outcome)));
         }
 
         if self.blocks.contains_key(&block_number) {
-            let mut execution_outcome = self.execution_outcome.clone();
+            let mut execution_outcome = Arc::unwrap_or_clone(Arc::clone(&self.execution_outcome));
             execution_outcome.revert_to(block_number);
-            return Some(execution_outcome)
+            return Some(execution_outcome);
         }
         None
     }
@@ -158,13 +219,17 @@ impl<N: NodePrimitives> Chain<N> {
     pub fn into_inner(
         self,
     ) -> (ChainBlocks<'static, N::Block>, ExecutionOutcome<N::Receipt>, Option<TrieUpdates>) {
-        (ChainBlocks { blocks: Cow::Owned(self.blocks) }, self.execution_outcome, self.trie_updates)
+        (
+            ChainBlocks { blocks: Cow::Owned(self.blocks) },
+            Arc::unwrap_or_clone(self.execution_outcome),
+            self.trie_updates,
+        )
     }
 
     /// Destructure the chain into its inner components:
     /// 1. A reference to the blocks contained in the chain.
     /// 2. A reference to the execution outcome representing the final state.
-    pub const fn inner(&self) -> (ChainBlocks<'_, N::Block>, &ExecutionOutcome<N::Receipt>) {
+    pub fn inner(&self) -> (ChainBlocks<'_, N::Block>, &ExecutionOutcome<N::Receipt>) {
         (ChainBlocks { blocks: Cow::Borrowed(&self.blocks) }, &self.execution_outcome)
     }
 
@@ -175,7 +240,7 @@ impl<N: NodePrimitives> Chain<N> {
 
     /// Returns an iterator over all blocks in the chain with increasing block number.
     pub fn blocks_iter(&self) -> impl Iterator<Item = &RecoveredBlock<N::Block>> + '_ {
-        self.blocks().iter().map(|block| block.1)
+        self.blocks().iter().map(|block| block.1.as_ref())
     }
 
     /// Returns an iterator over all blocks and their receipts in the chain.
@@ -271,8 +336,24 @@ impl<N: NodePrimitives> Chain<N> {
         block: RecoveredBlock<N::Block>,
         execution_outcome: ExecutionOutcome<N::Receipt>,
     ) {
-        self.blocks.insert(block.header().number(), block);
-        self.execution_outcome.extend(execution_outcome);
+        let num = block.header().number();
+        self.blocks.insert(num, Arc::new(block));
+        Arc::make_mut(&mut self.execution_outcome).extend(execution_outcome);
+        self.trie_updates.take(); // reset
+    }
+
+    /// Append a single Arc-wrapped block with state to the chain.
+    ///
+    /// This is more efficient when the block is already Arc-wrapped.
+    /// This method assumes that blocks attachment to the chain has already been validated.
+    pub fn append_arc_block(
+        &mut self,
+        block: Arc<RecoveredBlock<N::Block>>,
+        execution_outcome: ExecutionOutcome<N::Receipt>,
+    ) {
+        let num = block.header().number();
+        self.blocks.insert(num, block);
+        Arc::make_mut(&mut self.execution_outcome).extend(execution_outcome);
         self.trie_updates.take(); // reset
     }
 
@@ -286,12 +367,13 @@ impl<N: NodePrimitives> Chain<N> {
         let chain_tip = self.tip();
         let other_fork_block = other.fork_block();
         if chain_tip.hash() != other_fork_block.hash {
-            return Err(other)
+            return Err(other);
         }
 
         // Insert blocks from other chain
         self.blocks.extend(other.blocks);
-        self.execution_outcome.extend(other.execution_outcome);
+        Arc::make_mut(&mut self.execution_outcome)
+            .extend(Arc::unwrap_or_clone(other.execution_outcome));
         self.trie_updates.take(); // reset
 
         Ok(())
@@ -301,7 +383,7 @@ impl<N: NodePrimitives> Chain<N> {
 /// Wrapper type for `blocks` display in `Chain`
 #[derive(Debug)]
 pub struct DisplayBlocksChain<'a, B: reth_primitives_traits::Block>(
-    pub &'a BTreeMap<BlockNumber, RecoveredBlock<B>>,
+    pub &'a BTreeMap<BlockNumber, Arc<RecoveredBlock<B>>>,
 );
 
 impl<B: reth_primitives_traits::Block> fmt::Display for DisplayBlocksChain<'_, B> {
@@ -322,21 +404,21 @@ impl<B: reth_primitives_traits::Block> fmt::Display for DisplayBlocksChain<'_, B
 /// All blocks in the chain
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChainBlocks<'a, B: Block> {
-    blocks: Cow<'a, BTreeMap<BlockNumber, RecoveredBlock<B>>>,
+    blocks: Cow<'a, BTreeMap<BlockNumber, Arc<RecoveredBlock<B>>>>,
 }
 
 impl<B: Block<Body: BlockBody<Transaction: SignedTransaction>>> ChainBlocks<'_, B> {
-    /// Creates a consuming iterator over all blocks in the chain with increasing block number.
+    /// Creates a consuming iterator over all Arc-wrapped blocks in the chain with increasing block number.
     ///
     /// Note: this always yields at least one block.
     #[inline]
-    pub fn into_blocks(self) -> impl Iterator<Item = RecoveredBlock<B>> {
+    pub fn into_blocks(self) -> impl Iterator<Item = Arc<RecoveredBlock<B>>> {
         self.blocks.into_owned().into_values()
     }
 
     /// Creates an iterator over all blocks in the chain with increasing block number.
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (&BlockNumber, &RecoveredBlock<B>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&BlockNumber, &Arc<RecoveredBlock<B>>)> {
         self.blocks.iter()
     }
 
@@ -347,7 +429,7 @@ impl<B: Block<Body: BlockBody<Transaction: SignedTransaction>>> ChainBlocks<'_, 
     /// Chains always have at least one block.
     #[inline]
     pub fn tip(&self) -> &RecoveredBlock<B> {
-        self.blocks.last_key_value().expect("Chain should have at least one block").1
+        self.blocks.last_key_value().expect("Chain should have at least one block").1.as_ref()
     }
 
     /// Get the _first_ block of the chain.
@@ -357,7 +439,7 @@ impl<B: Block<Body: BlockBody<Transaction: SignedTransaction>>> ChainBlocks<'_, 
     /// Chains always have at least one block.
     #[inline]
     pub fn first(&self) -> &RecoveredBlock<B> {
-        self.blocks.first_key_value().expect("Chain should have at least one block").1
+        self.blocks.first_key_value().expect("Chain should have at least one block").1.as_ref()
     }
 
     /// Returns an iterator over all transactions in the chain.
@@ -394,8 +476,8 @@ impl<B: Block<Body: BlockBody<Transaction: SignedTransaction>>> ChainBlocks<'_, 
 }
 
 impl<B: Block> IntoIterator for ChainBlocks<'_, B> {
-    type Item = (BlockNumber, RecoveredBlock<B>);
-    type IntoIter = alloc::collections::btree_map::IntoIter<BlockNumber, RecoveredBlock<B>>;
+    type Item = (BlockNumber, Arc<RecoveredBlock<B>>);
+    type IntoIter = alloc::collections::btree_map::IntoIter<BlockNumber, Arc<RecoveredBlock<B>>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.blocks.into_owned().into_iter()
@@ -417,7 +499,7 @@ pub struct BlockReceipts<T = reth_ethereum_primitives::Receipt> {
 #[cfg(feature = "serde-bincode-compat")]
 pub(super) mod serde_bincode_compat {
     use crate::{serde_bincode_compat, ExecutionOutcome};
-    use alloc::{borrow::Cow, collections::BTreeMap};
+    use alloc::{borrow::Cow, collections::BTreeMap, sync::Arc};
     use alloy_primitives::BlockNumber;
     use reth_ethereum_primitives::EthPrimitives;
     use reth_primitives_traits::{
@@ -460,7 +542,7 @@ pub(super) mod serde_bincode_compat {
         'a,
         B: reth_primitives_traits::Block<Header: SerdeBincodeCompat, Body: SerdeBincodeCompat>
             + 'static,
-    >(Cow<'a, BTreeMap<BlockNumber, reth_primitives_traits::RecoveredBlock<B>>>);
+    >(Cow<'a, BTreeMap<BlockNumber, Arc<reth_primitives_traits::RecoveredBlock<B>>>>);
 
     impl<B> Serialize for RecoveredBlocks<'_, B>
     where
@@ -473,7 +555,11 @@ pub(super) mod serde_bincode_compat {
             let mut state = serializer.serialize_map(Some(self.0.len()))?;
 
             for (block_number, block) in self.0.iter() {
-                state.serialize_entry(block_number, &RecoveredBlock::<'_, B>::from(block))?;
+                // Dereference Arc to get &RecoveredBlock
+                state.serialize_entry(
+                    block_number,
+                    &RecoveredBlock::<'_, B>::from(block.as_ref()),
+                )?;
             }
 
             state.end()
@@ -489,8 +575,17 @@ pub(super) mod serde_bincode_compat {
             D: Deserializer<'de>,
         {
             Ok(Self(Cow::Owned(
-                BTreeMap::<BlockNumber, RecoveredBlock<'_, B>>::deserialize(deserializer)
-                    .map(|blocks| blocks.into_iter().map(|(n, b)| (n, b.into())).collect())?,
+                BTreeMap::<BlockNumber, RecoveredBlock<'_, B>>::deserialize(deserializer).map(
+                    |blocks| {
+                        blocks
+                            .into_iter()
+                            .map(|(n, b)| {
+                                let recovered: reth_primitives_traits::RecoveredBlock<B> = b.into();
+                                (n, Arc::new(recovered))
+                            })
+                            .collect()
+                    },
+                )?,
             )))
         }
     }
@@ -519,7 +614,7 @@ pub(super) mod serde_bincode_compat {
         fn from(value: Chain<'a, N>) -> Self {
             Self {
                 blocks: value.blocks.0.into_owned(),
-                execution_outcome: ExecutionOutcome::from_repr(value.execution_outcome),
+                execution_outcome: Arc::new(ExecutionOutcome::from_repr(value.execution_outcome)),
                 trie_updates: value.trie_updates.map(Into::into),
             }
         }
@@ -617,11 +712,15 @@ mod tests {
 
         block3.set_parent_hash(block2_hash);
 
-        let mut chain1: Chain =
-            Chain { blocks: BTreeMap::from([(1, block1), (2, block2)]), ..Default::default() };
+        let mut chain1: Chain = Chain {
+            blocks: BTreeMap::from([(1, Arc::new(block1)), (2, Arc::new(block2))]),
+            ..Default::default()
+        };
 
-        let chain2 =
-            Chain { blocks: BTreeMap::from([(3, block3), (4, block4)]), ..Default::default() };
+        let chain2 = Chain {
+            blocks: BTreeMap::from([(3, Arc::new(block3)), (4, Arc::new(block4))]),
+            ..Default::default()
+        };
 
         assert!(chain1.append_chain(chain2.clone()).is_ok());
 
@@ -738,7 +837,7 @@ mod tests {
         // Create a Chain object with a BTreeMap of blocks mapped to their block numbers,
         // including block1_hash and block2_hash, and the execution_outcome
         let chain: Chain = Chain {
-            blocks: BTreeMap::from([(10, block1), (11, block2)]),
+            blocks: BTreeMap::from([(10, Arc::new(block1)), (11, Arc::new(block2))]),
             execution_outcome: execution_outcome.clone(),
             ..Default::default()
         };

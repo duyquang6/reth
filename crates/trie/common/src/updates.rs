@@ -1,3 +1,6 @@
+use std::time::Instant;
+
+use ::metrics::{histogram, Label};
 use crate::{utils::extend_sorted_vec, BranchNodeCompact, HashBuilder, Nibbles};
 use alloc::{
     collections::{btree_map::BTreeMap, btree_set::BTreeSet},
@@ -7,6 +10,9 @@ use alloy_primitives::{
     map::{B256Map, B256Set, HashMap, HashSet},
     FixedBytes, B256,
 };
+
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
 
 /// The aggregation of trie updates.
 #[derive(PartialEq, Eq, Clone, Default, Debug)]
@@ -119,6 +125,8 @@ impl TrieUpdates {
     /// This allows us to reuse the allocated space. This allocates new space for the sorted
     /// updates, like `into_sorted`.
     pub fn drain_into_sorted(&mut self) -> TrieUpdatesSorted {
+        let total_start = Instant::now();
+        let start = Instant::now();
         let mut account_nodes = self
             .account_nodes
             .drain()
@@ -129,16 +137,111 @@ impl TrieUpdates {
             })
             .collect::<Vec<_>>();
 
+        histogram!(
+            "trie.common.updates.drain_into_sorted",
+            vec![Label::new("operation", "account_nodes_drain")]
+        )
+        .record(start.elapsed());
+
+        let start = Instant::now();
         account_nodes.extend(self.removed_nodes.drain().map(|path| (path, None)));
         account_nodes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
+        histogram!(
+            "trie.common.updates.drain_into_sorted",
+            vec![Label::new("operation", "account_nodes_extend_sort")]
+        )
+        .record(start.elapsed());
+
+        let start = Instant::now();
         let storage_tries = self
             .storage_tries
             .drain()
             .map(|(hashed_address, updates)| (hashed_address, updates.into_sorted()))
             .collect();
+        histogram!(
+            "trie.common.updates.drain_into_sorted",
+            vec![Label::new("operation", "storage_tries")]
+        )
+        .record(start.elapsed());
+        
+        histogram!(
+            "trie.common.updates.drain_into_sorted",
+            vec![Label::new("operation", "total")]
+        )
+        .record(total_start.elapsed());
+        
         TrieUpdatesSorted { account_nodes, storage_tries }
     }
+
+    // /// Converts trie updates into [`TrieUpdatesSorted`], but keeping the maps allocated by
+    // /// draining.
+    // ///
+    // /// This effectively clears all the fields in the [`TrieUpdatesSorted`].
+    // ///
+    // /// This allows us to reuse the allocated space. This allocates new space for the sorted
+    // /// updates, like `into_sorted`.
+    // pub fn drain_into_sorted(&mut self) -> TrieUpdatesSorted {
+    //     let total_start = Instant::now();
+        
+    //     let start = Instant::now();
+    //     let mut account_nodes = self
+    //         .account_nodes
+    //         .drain()
+    //         .map(|(path, node)| {
+    //             // Updated nodes take precedence over removed nodes.
+    //             self.removed_nodes.remove(&path);
+    //             (path, Some(node))
+    //         })
+    //         .collect::<Vec<_>>();
+
+    //     histogram!(
+    //         "trie.common.updates.drain_into_sorted",
+    //         vec![Label::new("operation", "account_nodes_drain")]
+    //     )
+    //     .record(start.elapsed());
+
+    //     let start = Instant::now();
+
+    //     account_nodes.extend(self.removed_nodes.drain().map(|path| (path, None)));
+        
+    //     #[cfg(feature = "rayon")]
+    //     account_nodes.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    //     #[cfg(not(feature = "rayon"))]
+    //     account_nodes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    //     histogram!(
+    //         "trie.common.updates.drain_into_sorted",
+    //         vec![Label::new("operation", "account_nodes_extend_sort")]
+    //     )
+    //     .record(start.elapsed());
+
+    //     let start = Instant::now();
+    //     #[cfg(feature = "rayon")]
+    //     let storage_tries = std::mem::take(&mut self.storage_tries)
+    //         .into_par_iter()
+    //         .map(|(hashed_address, updates)| (hashed_address, updates.into_sorted()))
+    //         .collect();
+    //     #[cfg(not(feature = "rayon"))]
+    //     let storage_tries = self
+    //         .storage_tries
+    //         .drain()
+    //         .map(|(hashed_address, updates)| (hashed_address, updates.into_sorted()))
+    //         .collect();
+    //     histogram!(
+    //         "trie.common.updates.drain_into_sorted",
+    //         vec![Label::new("operation", "storage_tries")]
+    //     )
+    //     .record(start.elapsed());
+        
+    //     histogram!(
+    //         "trie.common.updates.drain_into_sorted",
+    //         vec![Label::new("operation", "total")]
+    //     )
+    //     .record(total_start.elapsed());
+        
+    //     TrieUpdatesSorted { account_nodes, storage_tries }
+    // }
 
     /// Converts trie updates into [`TrieUpdatesSortedRef`].
     pub fn into_sorted_ref<'a>(&'a self) -> TrieUpdatesSortedRef<'a> {

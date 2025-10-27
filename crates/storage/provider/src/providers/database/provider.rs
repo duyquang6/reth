@@ -1,24 +1,11 @@
 use crate::{
-    changesets_utils::{
-        storage_trie_wiped_changeset_iter, StorageRevertsIter, StorageTrieCurrentValuesIter,
-    },
-    providers::{
-        database::{chain::ChainStorage, metrics},
-        static_file::StaticFileWriter,
-        NodeTypesForProvider, StaticFileProvider,
-    },
-    to_range,
-    traits::{
+    AccountReader, BlockBodyWriter, BlockExecutionWriter, BlockHashReader, BlockNumReader, BlockReader, BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter, DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider, HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef, OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit, StageCheckpointReader, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader, StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieReader, TrieWriter, changesets_utils::{
+        StorageRevertsIter, StorageTrieCurrentValuesIter, storage_trie_wiped_changeset_iter
+    }, providers::{
+        NodeTypesForProvider, StaticFileProvider, database::{chain::ChainStorage, metrics}, static_file::StaticFileWriter
+    }, to_range, traits::{
         AccountExtReader, BlockSource, ChangeSetReader, ReceiptProvider, StageCheckpointWriter,
-    },
-    AccountReader, BlockBodyWriter, BlockExecutionWriter, BlockHashReader, BlockNumReader,
-    BlockReader, BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter,
-    DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider,
-    HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef,
-    OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit,
-    StageCheckpointReader, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader,
-    StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
-    TransactionsProviderExt, TrieReader, TrieWriter,
+    }
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta, TxHashRef},
@@ -66,8 +53,8 @@ use reth_trie::{
         InMemoryTrieCursor, InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory,
         TrieCursorIter,
     },
-    updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
-    BranchNodeCompact, HashedPostStateSorted, Nibbles, StoredNibbles, StoredNibblesSubKey,
+    updates::{StorageTrieUpdatesSorted, TrieUpdates, TrieUpdatesSorted},
+    BranchNodeCompact, HashedPostState, HashedPostStateSorted, Nibbles, StoredNibbles, StoredNibblesSubKey,
     TrieChangeSetsEntry,
 };
 use reth_trie_db::{
@@ -76,12 +63,14 @@ use reth_trie_db::{
 use revm_database::states::{
     PlainStateReverts, PlainStorageChangeset, PlainStorageRevert, StateChangeset,
 };
+use ::metrics::{gauge, histogram, Label};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::{Deref, DerefMut, Not, Range, RangeBounds, RangeFrom, RangeInclusive},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tracing::{debug, trace};
 
@@ -176,10 +165,10 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
     ) -> ProviderResult<Box<dyn StateProvider + 'a>> {
         let mut block_number =
             self.block_number(block_hash)?.ok_or(ProviderError::BlockHashNotFound(block_hash))?;
-        if block_number == self.best_block_number().unwrap_or_default() &&
-            block_number == self.last_block_number().unwrap_or_default()
+        if block_number == self.best_block_number().unwrap_or_default()
+            && block_number == self.last_block_number().unwrap_or_default()
         {
-            return Ok(Box::new(LatestStateProviderRef::new(self)))
+            return Ok(Box::new(LatestStateProviderRef::new(self)));
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
@@ -260,11 +249,10 @@ impl<TX, N: NodeTypes> AsRef<Self> for DatabaseProvider<TX, N> {
 }
 
 impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
-    /// Writes executed blocks and state to storage.
     pub fn save_blocks(&self, blocks: Vec<ExecutedBlock<N::Primitives>>) -> ProviderResult<()> {
         if blocks.is_empty() {
             debug!(target: "providers::db", "Attempted to write empty block range");
-            return Ok(())
+            return Ok(());
         }
 
         // NOTE: checked non-empty above
@@ -276,6 +264,10 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
         debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
 
+        // Record block count metric (gauge for current batch size)
+        gauge!("storage.providers.database.save_blocks.count", vec![]).set(blocks.len() as f64);
+
+        let mut agg_hashed_state = HashedPostState::default();
         // TODO: Do performant / batched writes for each type of object
         // instead of a loop over all blocks,
         // meaning:
@@ -296,16 +288,20 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             self.write_state(&execution_output, OriginalValuesKnown::No)?;
 
             // insert hashes and intermediate merkle nodes
-            self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
+            agg_hashed_state.extend(Arc::unwrap_or_clone(hashed_state));
 
             // sort trie updates and insert changesets
+            // 83ms
             let trie_updates_sorted = (*trie_updates).clone().into_sorted();
             self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
             self.write_trie_updates_sorted(&trie_updates_sorted)?;
         }
 
+        self.write_hashed_state(&agg_hashed_state.into_sorted())?;
+
         // update history indices
         self.update_history_indices(first_number..=last_block_number)?;
+        debug!(target: "providers::db", range = ?first_number..=last_block_number, "Updated history indices");
 
         // Update pipeline progress
         self.update_pipeline_stages(last_block_number, false)?;
@@ -389,7 +385,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
         // if the block number is the same as the currently best block number on disk we can use the
         // latest state provider here
         if block_number == self.best_block_number().unwrap_or_default() {
-            return Ok(Box::new(LatestStateProvider::new(self)))
+            return Ok(Box::new(LatestStateProvider::new(self)));
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
@@ -453,7 +449,7 @@ where
     while let Some((sharded_key, list)) = item {
         // If the shard does not belong to the key, break.
         if !shard_belongs_to_key(&sharded_key) {
-            break
+            break;
         }
 
         // Always delete the current shard from the database first
@@ -468,18 +464,18 @@ where
         // Keep it deleted (don't return anything for reinsertion)
         if first >= block_number {
             item = cursor.prev()?;
-            continue
+            continue;
         }
         // Case 2: This is a boundary shard (spans across the unwinding point)
         // The shard contains some blocks below and some at/above the unwinding point
         else if block_number <= sharded_key.as_ref().highest_block_number {
             // Return only the block numbers that are below the unwinding point
             // These will be reinserted to preserve the historical data
-            return Ok(list.iter().take_while(|i| *i < block_number).collect::<Vec<_>>())
+            return Ok(list.iter().take_while(|i| *i < block_number).collect::<Vec<_>>());
         }
         // Case 3: Entire shard is below the unwinding point
         // Return all block numbers for reinsertion (preserve entire shard)
-        return Ok(list.iter().collect::<Vec<_>>())
+        return Ok(list.iter().collect::<Vec<_>>());
     }
 
     // No shards found or all processed
@@ -582,7 +578,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         F: FnMut(H, BodyTy<N>, Range<TxNumber>) -> ProviderResult<R>,
     {
         if range.is_empty() {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
 
         let len = range.end().saturating_sub(*range.start()) as usize;
@@ -757,30 +753,11 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
 }
 
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
-    /// Load shard and remove it. If list is empty, last shard was full or
-    /// there are no shards at all.
-    fn take_shard<T>(
-        &self,
-        cursor: &mut <TX as DbTxMut>::CursorMut<T>,
-        key: T::Key,
-    ) -> ProviderResult<Vec<u64>>
-    where
-        T: Table<Value = BlockNumberList>,
-    {
-        if let Some((_, list)) = cursor.seek_exact(key)? {
-            // delete old shard so new one can be inserted.
-            cursor.delete_current()?;
-            let list = list.iter().collect::<Vec<_>>();
-            return Ok(list)
-        }
-        Ok(Vec::new())
-    }
-
     /// Insert history index to the database.
     ///
-    /// For each updated partial key, this function removes the last shard from
-    /// the database (if any), appends the new indices to it, chunks the resulting integer list and
-    /// inserts the new shards back into the database.
+    /// For each updated partial key, this function retrieves the last shard from the database
+    /// (if any), appends the new indices to it, chunks the resulting list if needed, and upserts
+    /// the shards back into the database.
     ///
     /// This function is used by history indexing stages.
     fn append_history_index<P, T>(
@@ -793,25 +770,39 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
         T: Table<Value = BlockNumberList>,
     {
         let mut cursor = self.tx.cursor_write::<T>()?;
+
         for (partial_key, indices) in index_updates {
-            let mut last_shard =
-                self.take_shard::<T>(&mut cursor, sharded_key_factory(partial_key, u64::MAX))?;
-            last_shard.extend(indices);
-            // Chunk indices and insert them in shards of N size.
-            let mut chunks = last_shard.chunks(sharded_key::NUM_OF_INDICES_IN_SHARD).peekable();
-            while let Some(list) = chunks.next() {
-                let highest_block_number = if chunks.peek().is_some() {
-                    *list.last().expect("`chunks` does not return empty list")
+            let last_key = sharded_key_factory(partial_key, u64::MAX);
+            let mut last_shard = cursor
+                .seek_exact(last_key.clone())?
+                .map(|(_, list)| list)
+                .unwrap_or_else(BlockNumberList::empty);
+
+            last_shard.append(indices).map_err(ProviderError::other)?;
+
+            // fast path: all indices fit in one shard
+            if last_shard.len() <= sharded_key::NUM_OF_INDICES_IN_SHARD as u64 {
+                cursor.upsert(last_key, &last_shard)?;
+                continue;
+            }
+
+            // slow path: rechunk into multiple shards
+            let chunks = last_shard.iter().chunks(sharded_key::NUM_OF_INDICES_IN_SHARD);
+            let mut chunks_peekable = chunks.into_iter().peekable();
+
+            while let Some(chunk) = chunks_peekable.next() {
+                let shard = BlockNumberList::new_pre_sorted(chunk);
+                let highest_block_number = if chunks_peekable.peek().is_some() {
+                    shard.iter().next_back().expect("`chunks` does not return empty list")
                 } else {
                     // Insert last list with `u64::MAX`.
                     u64::MAX
                 };
-                cursor.insert(
-                    sharded_key_factory(partial_key, highest_block_number),
-                    &BlockNumberList::new_pre_sorted(list.iter().copied()),
-                )?;
+
+                cursor.upsert(sharded_key_factory(partial_key, highest_block_number), &shard)?;
             }
         }
+
         Ok(())
     }
 }
@@ -943,7 +934,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderSyncGapProvider
             }
             Ordering::Less => {
                 // There's either missing or corrupted files.
-                return Err(ProviderError::HeaderNotFound(next_static_file_block_num.into()))
+                return Err(ProviderError::HeaderNotFound(next_static_file_block_num.into()));
             }
             Ordering::Equal => {}
         }
@@ -1054,15 +1045,15 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
     /// If the header is found, but the transactions either do not exist, or are not indexed, this
     /// will return None.
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
-        if let Some(number) = self.convert_hash_or_number(id)? &&
-            let Some(header) = self.header_by_number(number)?
+        if let Some(number) = self.convert_hash_or_number(id)?
+            && let Some(header) = self.header_by_number(number)?
         {
             // If the body indices are not found, this means that the transactions either do not
             // exist in the database yet, or they do exit but are not indexed.
             // If they exist but are not indexed, we don't have enough
             // information to return the block anyways, so we return `None`.
             let Some(transactions) = self.transactions_by_block(number.into())? else {
-                return Ok(None)
+                return Ok(None);
             };
 
             let body = self
@@ -1072,7 +1063,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
                 .pop()
                 .ok_or(ProviderError::InvalidStorageOutput)?;
 
-            return Ok(Some(Self::Block::new(header, body)))
+            return Ok(Some(Self::Block::new(header, body)));
         }
 
         Ok(None)
@@ -1229,10 +1220,10 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         tx_hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
-        if let Some(transaction_id) = self.transaction_id(tx_hash)? &&
-            let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? &&
-            let Some(block_number) = self.block_by_transaction_id(transaction_id)? &&
-            let Some(sealed_header) = self.sealed_header(block_number)?
+        if let Some(transaction_id) = self.transaction_id(tx_hash)?
+            && let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)?
+            && let Some(block_number) = self.block_by_transaction_id(transaction_id)?
+            && let Some(sealed_header) = self.sealed_header(block_number)?
         {
             let (header, block_hash) = sealed_header.split();
             if let Some(block_body) = self.block_body_indices(block_number)? {
@@ -1252,7 +1243,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
                     timestamp: header.timestamp(),
                 };
 
-                return Ok(Some((transaction, meta)))
+                return Ok(Some((transaction, meta)));
             }
         }
 
@@ -1268,15 +1259,15 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
-        if let Some(block_number) = self.convert_hash_or_number(id)? &&
-            let Some(body) = self.block_body_indices(block_number)?
+        if let Some(block_number) = self.convert_hash_or_number(id)?
+            && let Some(body) = self.block_body_indices(block_number)?
         {
             let tx_range = body.tx_num_range();
             return if tx_range.is_empty() {
                 Ok(Some(Vec::new()))
             } else {
                 self.transactions_by_tx_range(tx_range).map(Some)
-            }
+            };
         }
         Ok(None)
     }
@@ -1343,15 +1334,15 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
         &self,
         block: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
-        if let Some(number) = self.convert_hash_or_number(block)? &&
-            let Some(body) = self.block_body_indices(number)?
+        if let Some(number) = self.convert_hash_or_number(block)?
+            && let Some(body) = self.block_body_indices(number)?
         {
             let tx_range = body.tx_num_range();
             return if tx_range.is_empty() {
                 Ok(Some(Vec::new()))
             } else {
                 self.receipts_by_tx_range(tx_range).map(Some)
-            }
+            };
         }
         Ok(None)
     }
@@ -1577,6 +1568,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         execution_outcome: &ExecutionOutcome<Self::Receipt>,
         is_value_known: OriginalValuesKnown,
     ) -> ProviderResult<()> {
+        let start = Instant::now();
         let first_block = execution_outcome.first_block();
         let block_count = execution_outcome.len() as u64;
         let last_block = execution_outcome.last_block();
@@ -1586,16 +1578,37 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
         let (plain_state, reverts) =
             execution_outcome.bundle.to_plain_state_and_reverts(is_value_known);
+        histogram!("storage.providers.database.block.write_state", 
+            vec![Label::new("operation", "to_plain_state_and_reverts")]).record(start.elapsed());
 
+        let reverts_start = Instant::now();
         self.write_state_reverts(reverts, first_block)?;
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "reverts")]
+        )
+        .record(reverts_start.elapsed());
+
+        let changes_start = Instant::now();
         self.write_state_changes(plain_state)?;
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "changes")]
+        )
+        .record(changes_start.elapsed());
 
         // Fetch the first transaction number for each block in the range
+        let block_indices_start = Instant::now();
         let block_indices: Vec<_> = self
             .block_body_indices_range(block_range)?
             .into_iter()
             .map(|b| b.first_tx_num)
             .collect();
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "block_indices")]
+        )
+        .record(block_indices_start.elapsed());
 
         // Ensure all expected blocks are present.
         if block_indices.len() < block_count as usize {
@@ -1626,6 +1639,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         let prunable_receipts =
             PruneMode::Distance(MINIMUM_PRUNING_DISTANCE).should_prune(first_block, tip);
 
+        let receipts_start = Instant::now();
         for (idx, (receipts, first_tx_index)) in
             execution_outcome.receipts.iter().zip(block_indices).enumerate()
         {
@@ -1655,6 +1669,17 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 }
             }
         }
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "receipts")]
+        )
+        .record(receipts_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(())
     }
@@ -1664,8 +1689,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         reverts: PlainStateReverts,
         first_block: BlockNumber,
     ) -> ProviderResult<()> {
+        let start = Instant::now();
+        
         // Write storage changes
         tracing::trace!("Writing storage changes");
+        let storage_start = Instant::now();
         let mut storages_cursor = self.tx_ref().cursor_dup_write::<tables::PlainStorageState>()?;
         let mut storage_changeset_cursor =
             self.tx_ref().cursor_dup_write::<tables::StorageChangeSets>()?;
@@ -1709,9 +1737,15 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 }
             }
         }
+        histogram!(
+            "storage.providers.database.write_state_reverts",
+            vec![Label::new("operation", "storage")]
+        )
+        .record(storage_start.elapsed());
 
         // Write account changes
         tracing::trace!("Writing account changes");
+        let account_start = Instant::now();
         let mut account_changeset_cursor =
             self.tx_ref().cursor_dup_write::<tables::AccountChangeSets>()?;
 
@@ -1727,19 +1761,39 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 )?;
             }
         }
+        histogram!(
+            "storage.providers.database.write_state_reverts",
+            vec![Label::new("operation", "account")]
+        )
+        .record(account_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.write_state_reverts",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(())
     }
 
     fn write_state_changes(&self, mut changes: StateChangeset) -> ProviderResult<()> {
+        let start = Instant::now();
+        
         // sort all entries so they can be written to database in more performant way.
         // and take smaller memory footprint.
+        let sort_start = Instant::now();
         changes.accounts.par_sort_by_key(|a| a.0);
         changes.storage.par_sort_by_key(|a| a.address);
         changes.contracts.par_sort_by_key(|a| a.0);
+        histogram!(
+            "storage.providers.database.write_state_changes",
+            vec![Label::new("operation", "sort")]
+        )
+        .record(sort_start.elapsed());
 
         // Write new account state
         tracing::trace!(len = changes.accounts.len(), "Writing new account state");
+        let account_start = Instant::now();
         let mut accounts_cursor = self.tx_ref().cursor_write::<tables::PlainAccountState>()?;
         // write account to database.
         for (address, account) in changes.accounts {
@@ -1751,16 +1805,28 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 accounts_cursor.delete_current()?;
             }
         }
+        histogram!(
+            "storage.providers.database.write_state_changes",
+            vec![Label::new("operation", "account")]
+        )
+        .record(account_start.elapsed());
 
         // Write bytecode
         tracing::trace!(len = changes.contracts.len(), "Writing bytecodes");
+        let bytecode_start = Instant::now();
         let mut bytecodes_cursor = self.tx_ref().cursor_write::<tables::Bytecodes>()?;
         for (hash, bytecode) in changes.contracts {
             bytecodes_cursor.upsert(hash, &Bytecode(bytecode))?;
         }
+        histogram!(
+            "storage.providers.database.write_state_changes",
+            vec![Label::new("operation", "bytecode")]
+        )
+        .record(bytecode_start.elapsed());
 
         // Write new storage state and wipe storage if needed.
         tracing::trace!(len = changes.storage.len(), "Writing new storage state");
+        let storage_start = Instant::now();
         let mut storages_cursor = self.tx_ref().cursor_dup_write::<tables::PlainStorageState>()?;
         for PlainStorageChangeset { address, wipe_storage, storage } in changes.storage {
             // Wiping of storage.
@@ -1788,12 +1854,26 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 }
             }
         }
+        histogram!(
+            "storage.providers.database.write_state_changes",
+            vec![Label::new("operation", "storage")]
+        )
+        .record(storage_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.write_state_changes",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(())
     }
 
     fn write_hashed_state(&self, hashed_state: &HashedPostStateSorted) -> ProviderResult<()> {
+        let start = Instant::now();
+        
         // Write hashed account updates.
+        let accounts_start = Instant::now();
         let mut hashed_accounts_cursor = self.tx_ref().cursor_write::<tables::HashedAccounts>()?;
         for (hashed_address, account) in hashed_state.accounts().accounts_sorted() {
             if let Some(account) = account {
@@ -1802,8 +1882,14 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 hashed_accounts_cursor.delete_current()?;
             }
         }
+        histogram!(
+            "storage.providers.database.block.write_hashed_state",
+            vec![Label::new("operation", "accounts")]
+        )
+        .record(accounts_start.elapsed());
 
         // Write hashed storage changes.
+        let storage_start = Instant::now();
         let sorted_storages = hashed_state.account_storages().iter().sorted_by_key(|(key, _)| *key);
         let mut hashed_storage_cursor =
             self.tx_ref().cursor_dup_write::<tables::HashedStorages>()?;
@@ -1826,6 +1912,17 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 }
             }
         }
+        histogram!(
+            "storage.providers.database.block.write_hashed_state",
+            vec![Label::new("operation", "storage")]
+        )
+        .record(storage_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.block.write_hashed_state",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(())
     }
@@ -1948,7 +2045,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         let range = block + 1..=self.last_block_number()?;
 
         if range.is_empty() {
-            return Ok(ExecutionOutcome::default())
+            return Ok(ExecutionOutcome::default());
         }
         let start_block_number = *range.start();
 
@@ -2061,13 +2158,15 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
     }
 }
 
+
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider<TX, N> {
     /// Writes trie updates to the database with already sorted updates.
     ///
     /// Returns the number of entries modified.
     fn write_trie_updates_sorted(&self, trie_updates: &TrieUpdatesSorted) -> ProviderResult<usize> {
+        let start = Instant::now();
         if trie_updates.is_empty() {
-            return Ok(0)
+            return Ok(0);
         }
 
         // Track the number of inserted entries.
@@ -2077,6 +2176,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         let mut account_trie_cursor = tx.cursor_write::<tables::AccountsTrie>()?;
 
         // Process sorted account nodes
+        let account_updates_start = Instant::now();
         for (key, updated_node) in trie_updates.account_nodes_ref() {
             let nibbles = StoredNibbles(*key);
             match updated_node {
@@ -2094,9 +2194,26 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
                 }
             }
         }
+        histogram!(
+            "storage.providers.database.block.write_trie_updates_sorted",
+            vec![Label::new("operation", "account_updates")]
+        )
+        .record(account_updates_start.elapsed());
 
+        let storage_updates_start = Instant::now();
         num_entries +=
             self.write_storage_trie_updates_sorted(trie_updates.storage_tries_ref().iter())?;
+        histogram!(
+            "storage.providers.database.block.write_trie_updates_sorted",
+            vec![Label::new("operation", "storage_updates")]
+        )
+        .record(storage_updates_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.block.write_trie_updates_sorted",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(num_entries)
     }
@@ -2114,6 +2231,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         trie_updates: &TrieUpdatesSorted,
         updates_overlay: Option<&TrieUpdatesSorted>,
     ) -> ProviderResult<usize> {
+        let start = Instant::now();
         let mut num_entries = 0;
 
         let mut changeset_cursor =
@@ -2135,6 +2253,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         let mut in_memory_account_cursor =
             InMemoryTrieCursor::new(Some(&mut db_account_cursor), account_overlay_updates);
 
+        let account_changesets_start = Instant::now();
         for (path, _) in trie_updates.account_nodes_ref() {
             num_entries += 1;
             let node = in_memory_account_cursor.seek_exact(*path)?.map(|(_, node)| node);
@@ -2143,15 +2262,54 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
                 TrieChangeSetsEntry { nibbles: StoredNibblesSubKey(*path), node },
             )?;
         }
+        debug!(target: "providers::db", num_entries = %num_entries, "account_changesets");
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "account_changesets")]
+        )
+        .record(account_changesets_start.elapsed());
 
+        let storage_changesets_start = Instant::now();
+        let collect_start = Instant::now();
         let mut storage_updates = trie_updates.storage_tries_ref().iter().collect::<Vec<_>>();
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "storage_collect")]
+        )
+        .record(collect_start.elapsed());
+        
+        let sort_start = Instant::now();
         storage_updates.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "storage_sort")]
+        )
+        .record(sort_start.elapsed());
 
-        num_entries += self.write_storage_trie_changesets(
+        let write_start = Instant::now();
+        let storage_changeset_count = self.write_storage_trie_changesets(
             block_number,
             storage_updates.into_iter(),
             updates_overlay,
         )?;
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "storage_write")]
+        )
+        .record(write_start.elapsed());
+        debug!(target: "providers::db", num_entries = %num_entries, storage_changeset_count = %storage_changeset_count, "storage_changesets");
+        num_entries += storage_changeset_count;
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "storage_changesets")]
+        )
+        .record(storage_changesets_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(num_entries)
     }
@@ -2348,8 +2506,16 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
         storage_tries: impl Iterator<Item = (&'a B256, &'a StorageTrieUpdatesSorted)>,
         updates_overlay: Option<&TrieUpdatesSorted>,
     ) -> ProviderResult<usize> {
+        let function_start = std::time::Instant::now();
         let mut num_written = 0;
-
+        
+        // Non-overlapping timing accumulators
+        let mut total_cursor_setup_time = std::time::Duration::ZERO;
+        let mut total_iterator_creation_time = std::time::Duration::ZERO;
+        let mut total_iterator_processing_time = std::time::Duration::ZERO;
+        let mut total_append_dup_time = std::time::Duration::ZERO;
+        
+        let cursor_init_start = std::time::Instant::now();
         let mut changeset_cursor =
             self.tx_ref().cursor_dup_write::<tables::StoragesTrieChangeSets>()?;
 
@@ -2373,11 +2539,14 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
 
         // Static empty array for when updates_overlay is None
         static EMPTY_UPDATES: Vec<(Nibbles, Option<BranchNodeCompact>)> = Vec::new();
+        
+        total_cursor_setup_time += cursor_init_start.elapsed();
 
         for (hashed_address, storage_trie_updates) in storage_tries {
             let changeset_key = BlockNumberHashedAddress((block_number, *hashed_address));
 
             // Update the hashed address for the cursors
+            let cursor_setup_start = std::time::Instant::now();
             changed_curr_values_cursor =
                 DatabaseStorageTrieCursor::new(changed_curr_values_cursor.cursor, *hashed_address);
 
@@ -2390,17 +2559,21 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
             // Wrap the cursor in InMemoryTrieCursor with the overlay
             let mut in_memory_changed_cursor =
                 InMemoryTrieCursor::new(Some(&mut changed_curr_values_cursor), overlay_updates);
-
+            total_cursor_setup_time += cursor_setup_start.elapsed();
+            
             // Create an iterator which produces the current values of all updated paths, or None if
             // they are currently unset.
+            let iterator_creation_start = std::time::Instant::now();
             let curr_values_of_changed = StorageTrieCurrentValuesIter::new(
                 storage_trie_updates.storage_nodes.iter().map(|e| e.0),
                 &mut in_memory_changed_cursor,
             )?;
+            total_iterator_creation_time += iterator_creation_start.elapsed();
 
             if storage_trie_updates.is_deleted() {
                 // Create an iterator that starts from the beginning of the storage trie for this
                 // account
+                let cursor_setup_start = std::time::Instant::now();
                 wiped_nodes_cursor =
                     DatabaseStorageTrieCursor::new(wiped_nodes_cursor.cursor, *hashed_address);
 
@@ -2408,30 +2581,157 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
                 let mut in_memory_wiped_cursor =
                     InMemoryTrieCursor::new(Some(&mut wiped_nodes_cursor), overlay_updates);
 
+
                 let all_nodes = TrieCursorIter::new(&mut in_memory_wiped_cursor);
+                total_cursor_setup_time += cursor_setup_start.elapsed();
 
                 for wiped in storage_trie_wiped_changeset_iter(curr_values_of_changed, all_nodes)? {
+                    let processing_start = std::time::Instant::now();
                     let (path, node) = wiped?;
                     num_written += 1;
+                    total_iterator_processing_time += processing_start.elapsed();
+                    
+                    let append_start = std::time::Instant::now();
                     changeset_cursor.append_dup(
                         changeset_key,
                         TrieChangeSetsEntry { nibbles: StoredNibblesSubKey(path), node },
                     )?;
+                    total_append_dup_time += append_start.elapsed();
                 }
             } else {
                 for curr_value in curr_values_of_changed {
+                    let processing_start = std::time::Instant::now();
                     let (path, node) = curr_value?;
                     num_written += 1;
+                    total_iterator_processing_time += processing_start.elapsed();
+                    
+                    let append_start = std::time::Instant::now();
                     changeset_cursor.append_dup(
                         changeset_key,
                         TrieChangeSetsEntry { nibbles: StoredNibblesSubKey(path), node },
                     )?;
+                    total_append_dup_time += append_start.elapsed();
                 }
             }
         }
 
+        // Record non-overlapping metrics that sum to total
+        histogram!("storage.providers.database.write_storage_trie_changesets", 
+            vec![Label::new("operation", "cursor_setup")])
+            .record(total_cursor_setup_time);
+        histogram!("storage.providers.database.write_storage_trie_changesets", 
+            vec![Label::new("operation", "iterator_creation")])
+            .record(total_iterator_creation_time);
+        histogram!("storage.providers.database.write_storage_trie_changesets", 
+            vec![Label::new("operation", "iterator_processing")])
+            .record(total_iterator_processing_time);
+        histogram!("storage.providers.database.write_storage_trie_changesets", 
+            vec![Label::new("operation", "append_dup")])
+            .record(total_append_dup_time);
+        histogram!("storage.providers.database.write_storage_trie_changesets", 
+            vec![Label::new("operation", "total")])
+            .record(function_start.elapsed());
+
         Ok(num_written)
     }
+
+    //     /// Records the current values of all trie nodes which will be updated using the
+    // /// `StorageTrieUpdates` into the storage trie changesets table.
+    // ///
+    // /// The intended usage of this method is to call it _prior_ to calling
+    // /// `write_storage_trie_updates` with the same set of `StorageTrieUpdates`.
+    // ///
+    // /// Returns the number of keys written.
+    // fn write_storage_trie_changesets<'a>(
+    //     &self,
+    //     block_number: BlockNumber,
+    //     storage_tries: impl Iterator<Item = (&'a B256, &'a StorageTrieUpdatesSorted)>,
+    //     updates_overlay: Option<&TrieUpdatesSorted>,
+    // ) -> ProviderResult<usize> {
+    //     let mut num_written = 0;
+
+    //     let mut changeset_cursor =
+    //         self.tx_ref().cursor_dup_write::<tables::StoragesTrieChangeSets>()?;
+
+    //     // We hold two cursors to the same table because we use them simultaneously when an
+    //     // account's storage is wiped. We keep them outside the for-loop so they can be re-used
+    //     // between accounts.
+    //     let changed_curr_values_cursor = self.tx_ref().cursor_dup_read::<tables::StoragesTrie>()?;
+    //     let wiped_nodes_cursor = self.tx_ref().cursor_dup_read::<tables::StoragesTrie>()?;
+
+    //     // DatabaseStorageTrieCursor requires ownership of the cursor. The easiest way to deal with
+    //     // this is to create this outer variable with an initial dummy account, and overwrite it on
+    //     // every loop for every real account.
+    //     let mut changed_curr_values_cursor = DatabaseStorageTrieCursor::new(
+    //         changed_curr_values_cursor,
+    //         B256::default(), // Will be set per iteration
+    //     );
+    //     let mut wiped_nodes_cursor = DatabaseStorageTrieCursor::new(
+    //         wiped_nodes_cursor,
+    //         B256::default(), // Will be set per iteration
+    //     );
+
+    //     // Static empty array for when updates_overlay is None
+    //     static EMPTY_UPDATES: Vec<(Nibbles, Option<BranchNodeCompact>)> = Vec::new();
+
+    //     for (hashed_address, storage_trie_updates) in storage_tries {
+    //         let changeset_key = BlockNumberHashedAddress((block_number, *hashed_address));
+
+    //         // Update the hashed address for the cursors
+    //         changed_curr_values_cursor =
+    //             DatabaseStorageTrieCursor::new(changed_curr_values_cursor.cursor, *hashed_address);
+
+    //         // Get the overlay updates for this storage trie, or use an empty array
+    //         let overlay_updates = updates_overlay
+    //             .and_then(|overlay| overlay.storage_tries_ref().get(hashed_address))
+    //             .map(|updates| updates.storage_nodes_ref())
+    //             .unwrap_or(&EMPTY_UPDATES);
+
+    //         // Wrap the cursor in InMemoryTrieCursor with the overlay
+    //         let mut in_memory_changed_cursor =
+    //             InMemoryTrieCursor::new(Some(&mut changed_curr_values_cursor), overlay_updates);
+
+    //         // Create an iterator which produces the current values of all updated paths, or None if
+    //         // they are currently unset.
+    //         let curr_values_of_changed = StorageTrieCurrentValuesIter::new(
+    //             storage_trie_updates.storage_nodes.iter().map(|e| e.0),
+    //             &mut in_memory_changed_cursor,
+    //         )?;
+
+    //         if storage_trie_updates.is_deleted() {
+    //             // Create an iterator that starts from the beginning of the storage trie for this
+    //             // account
+    //             wiped_nodes_cursor =
+    //                 DatabaseStorageTrieCursor::new(wiped_nodes_cursor.cursor, *hashed_address);
+
+    //             // Wrap the wiped nodes cursor in InMemoryTrieCursor with the overlay
+    //             let mut in_memory_wiped_cursor =
+    //                 InMemoryTrieCursor::new(Some(&mut wiped_nodes_cursor), overlay_updates);
+
+    //             let all_nodes = TrieCursorIter::new(&mut in_memory_wiped_cursor);
+
+    //             for wiped in storage_trie_wiped_changeset_iter(curr_values_of_changed, all_nodes)? {
+    //                 let (path, node) = wiped?;
+    //                 num_written += 1;
+    //                 changeset_cursor.append_dup(
+    //                     changeset_key,
+    //                     TrieChangeSetsEntry { nibbles: StoredNibblesSubKey(path), node },
+    //                 )?;
+    //             }
+    //         } else {
+    //             for curr_value in curr_values_of_changed {
+    //                 let (path, node) = curr_value?;
+    //                 num_written += 1;
+    //                 changeset_cursor.append_dup(
+    //                     changeset_key,
+    //                     TrieChangeSetsEntry { nibbles: StoredNibblesSubKey(path), node },
+    //                 )?;
+    //             }
+    //         }
+    //     }
+
+    //     Ok(num_written)
+    // }
 }
 
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvider<TX, N> {
@@ -2657,8 +2957,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
                 StorageShardedKey::last(address, storage_key),
                 rem_index,
                 |storage_sharded_key| {
-                    storage_sharded_key.address == address &&
-                        storage_sharded_key.sharded_key.key == storage_key
+                    storage_sharded_key.address == address
+                        && storage_sharded_key.sharded_key.key == storage_key
                 },
             )?;
 
@@ -2701,17 +3001,25 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
     }
 
     fn update_history_indices(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        // account history stage
-        {
-            let indices = self.changed_accounts_and_blocks_with_range(range.clone())?;
-            self.insert_account_history_index(indices)?;
-        }
+        let start = Instant::now();
+        // account history stage - step 1: changed accounts and blocks
+        let indices = self.changed_accounts_and_blocks_with_range(range.clone())?;
+        histogram!("storage.providers.database.update_history_indices", vec![Label::new("operation", "changed_accounts_and_blocks")]).record(start.elapsed());
 
-        // storage history stage
-        {
-            let indices = self.changed_storages_and_blocks_with_range(range)?;
-            self.insert_storage_history_index(indices)?;
-        }
+        // account history stage - step 2: insert account history index
+        let insert_account_history_index_start = Instant::now();
+        self.insert_account_history_index(indices)?;
+        histogram!("storage.providers.database.update_history_indices", vec![Label::new("operation", "insert_account_history_index")]).record(insert_account_history_index_start.elapsed());
+
+        // storage history stage - step 3: changed storages and blocks
+        let changed_storages_and_blocks_start = Instant::now();
+        let indices = self.changed_storages_and_blocks_with_range(range)?;
+        histogram!("storage.providers.database.update_history_indices", vec![Label::new("operation", "changed_storages_and_blocks")]).record(changed_storages_and_blocks_start.elapsed());
+
+        // storage history stage - step 4: insert storage history index
+        let insert_storage_history_index_start = Instant::now();
+        self.insert_storage_history_index(indices)?;
+        histogram!("storage.providers.database.update_history_indices", vec![Label::new("operation", "insert_storage_history_index")]).record(insert_storage_history_index_start.elapsed());
 
         Ok(())
     }
@@ -2792,41 +3100,74 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
     ) -> ProviderResult<StoredBlockBodyIndices> {
         let block_number = block.number();
 
+        let total_start = std::time::Instant::now();
         let mut durations_recorder = metrics::DurationsRecorder::default();
 
+        // Append header to static file
+        let start = std::time::Instant::now();
         self.static_file_provider
             .get_writer(block_number, StaticFileSegment::Headers)?
             .append_header(block.header(), &block.hash())?;
+        histogram!("storage.providers.database.insert_block", "operation" => "append_header")
+            .record(start.elapsed());
 
+        // Insert header numbers
+        let start = std::time::Instant::now();
         self.tx.put::<tables::HeaderNumbers>(block.hash(), block_number)?;
+        histogram!("storage.providers.database.insert_block", "operation" => "insert_header_numbers")
+            .record(start.elapsed());
         durations_recorder.record_relative(metrics::Action::InsertHeaderNumbers);
 
+        // Get next tx num
+        let start = std::time::Instant::now();
         let mut next_tx_num = self
             .tx
             .cursor_read::<tables::TransactionBlocks>()?
             .last()?
             .map(|(n, _)| n + 1)
             .unwrap_or_default();
+        histogram!("storage.providers.database.insert_block", "operation" => "get_next_tx_num")
+            .record(start.elapsed());
         durations_recorder.record_relative(metrics::Action::GetNextTxNum);
         let first_tx_num = next_tx_num;
 
         let tx_count = block.body().transaction_count() as u64;
 
-        // Ensures we have all the senders for the block's transactions.
+        // Insert transaction senders and hash numbers
+        let mut tx_senders_cursor = self.tx.cursor_write::<tables::TransactionSenders>()?;
+        let mut senders_duration = std::time::Duration::default();
+        let mut hash_numbers_duration = std::time::Duration::default();
+        
         for (transaction, sender) in block.body().transactions_iter().zip(block.senders_iter()) {
             let hash = transaction.tx_hash();
 
             if self.prune_modes.sender_recovery.as_ref().is_none_or(|m| !m.is_full()) {
-                self.tx.put::<tables::TransactionSenders>(next_tx_num, *sender)?;
+                let start = std::time::Instant::now();
+                tx_senders_cursor.append(next_tx_num, sender)?;
+                senders_duration += start.elapsed();
             }
 
             if self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full()) {
+                let start = std::time::Instant::now();
                 self.tx.put::<tables::TransactionHashNumbers>(*hash, next_tx_num)?;
+                hash_numbers_duration += start.elapsed();
             }
             next_tx_num += 1;
         }
+        histogram!("storage.providers.database.insert_block", "operation" => "insert_transaction_senders")
+            .record(senders_duration);
+        histogram!("storage.providers.database.insert_block", "operation" => "insert_transaction_hash_numbers")
+            .record(hash_numbers_duration);
 
+        // Append block bodies
+        let start = std::time::Instant::now();
         self.append_block_bodies(vec![(block_number, Some(block.into_body()))])?;
+        histogram!("storage.providers.database.insert_block", "operation" => "append_block_bodies")
+            .record(start.elapsed());
+
+        // Record total duration
+        histogram!("storage.providers.database.insert_block", "operation" => "total")
+            .record(total_start.elapsed());
 
         debug!(
             target: "providers::db",
@@ -2976,7 +3317,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
     ) -> ProviderResult<()> {
         if blocks.is_empty() {
             debug!(target: "providers::db", "Attempted to append empty block range");
-            return Ok(())
+            return Ok(());
         }
 
         // Blocks are not empty, so no need to handle the case of `blocks.first()` being
@@ -3126,8 +3467,15 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
             self.tx.commit()?;
             self.static_file_provider.commit()?;
         } else {
-            self.static_file_provider.commit()?;
+            let start_tx_commit = Instant::now();
             self.tx.commit()?;
+            let tx_commit_duration = start_tx_commit.elapsed();
+
+            let start_static_file_commit = Instant::now();
+            self.static_file_provider.commit()?;
+            let static_file_commit_duration = start_static_file_commit.elapsed();
+
+            tracing::debug!(target: "db::provider", ?tx_commit_duration, ?static_file_commit_duration,"Committed static files and database transaction");
         }
 
         Ok(true)

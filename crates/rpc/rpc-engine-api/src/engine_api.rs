@@ -359,6 +359,7 @@ where
         state: ForkchoiceState,
         payload_attrs: Option<EngineT::PayloadAttributes>,
     ) -> EngineApiResult<ForkchoiceUpdated> {
+        debug!(target: "rpc::engine", "fork_choice_updated_v3 entered");
         self.validate_and_execute_forkchoice(EngineApiMessageVersion::V3, state, payload_attrs)
             .await
     }
@@ -400,8 +401,10 @@ where
         EngineT::BuiltPayload: TryInto<R>,
     {
         // validate timestamp according to engine rules
+        debug!(target: "engine_api", %payload_id, "getting payload timestamp");
         let timestamp = self.get_payload_timestamp(payload_id).await?;
         validate_payload_timestamp(&self.inner.chain_spec, version, timestamp)?;
+        debug!(target: "engine_api", %payload_id, "payload timestamp validated");
 
         // Now resolve the payload
         self.get_built_payload(payload_id).await?.try_into().map_err(|_| {
@@ -576,9 +579,10 @@ where
             // > Client software MUST NOT return trailing null values if the request extends past the current latest known block.
             // truncate the end if it's greater than the last block
             if let Ok(best_block) = inner.provider.best_block_number()
-                && end > best_block {
-                    end = best_block;
-                }
+                && end > best_block
+            {
+                end = best_block;
+            }
 
             // Check if the requested range starts before the earliest available block due to pruning/expiry
             let earliest_block = inner.provider.earliest_block_number().unwrap_or(0);
@@ -718,11 +722,17 @@ where
         state: ForkchoiceState,
         payload_attrs: Option<EngineT::PayloadAttributes>,
     ) -> EngineApiResult<ForkchoiceUpdated> {
+        let entered_at = Instant::now();
         self.inner.record_elapsed_time_on_fcu();
+        let after_record_elapsed = entered_at.elapsed();
 
         if let Some(ref attrs) = payload_attrs {
+        debug!(target: "rpc::engine", ?payload_attrs, after_record_elapsed=?after_record_elapsed.as_millis(), "Validating and executing forkchoice");
+
             let attr_validation_res =
                 self.inner.validator.ensure_well_formed_attributes(version, attrs);
+
+        debug!(target: "rpc::engine", "validated payload attributes");
 
             // From the engine API spec:
             //
@@ -743,13 +753,16 @@ where
                 // TODO: decide if we want this branch - the FCU INVALID response might be more
                 // useful than the payload attributes INVALID response
                 if fcu_res.is_invalid() {
-                    return Ok(fcu_res)
+                    return Ok(fcu_res);
                 }
-                return Err(err.into())
+                return Err(err.into());
             }
         }
 
-        Ok(self.inner.beacon_consensus.fork_choice_updated(state, payload_attrs, version).await?)
+        let fcu_res =
+            self.inner.beacon_consensus.fork_choice_updated(state, payload_attrs, version).await?;
+        debug!(target: "rpc::engine", "Forkchoice updated result");
+        Ok(fcu_res)
     }
 
     /// Returns reference to supported capabilities.
@@ -771,7 +784,7 @@ where
         }
 
         if versioned_hashes.len() > MAX_BLOB_LIMIT {
-            return Err(EngineApiError::BlobRequestTooLarge { len: versioned_hashes.len() })
+            return Err(EngineApiError::BlobRequestTooLarge { len: versioned_hashes.len() });
         }
 
         self.inner
@@ -815,7 +828,7 @@ where
         }
 
         if versioned_hashes.len() > MAX_BLOB_LIMIT {
-            return Err(EngineApiError::BlobRequestTooLarge { len: versioned_hashes.len() })
+            return Err(EngineApiError::BlobRequestTooLarge { len: versioned_hashes.len() });
         }
 
         self.inner
@@ -1378,8 +1391,8 @@ mod tests {
                 blocks
                     .iter()
                     .filter(|b| {
-                        !first_missing_range.contains(&b.number) &&
-                            !second_missing_range.contains(&b.number)
+                        !first_missing_range.contains(&b.number)
+                            && !second_missing_range.contains(&b.number)
                     })
                     .map(|b| (b.hash(), b.clone().into_block())),
             );
@@ -1408,8 +1421,8 @@ mod tests {
                 // ensure we still return trailing `None`s here because by-hash will not be aware
                 // of the missing block's number, and cannot compare it to the current best block
                 .map(|b| {
-                    if first_missing_range.contains(&b.number) ||
-                        second_missing_range.contains(&b.number)
+                    if first_missing_range.contains(&b.number)
+                        || second_missing_range.contains(&b.number)
                     {
                         None
                     } else {

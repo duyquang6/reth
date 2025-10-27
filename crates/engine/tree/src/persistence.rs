@@ -80,6 +80,7 @@ where
         while let Ok(action) = self.incoming.recv() {
             match action {
                 PersistenceAction::RemoveBlocksAbove(new_tip_num, sender) => {
+                    debug!(target: "engine::persistence", "receive remove block");
                     let result = self.on_remove_blocks_above(new_tip_num)?;
                     // send new sync metrics based on removed blocks
                     let _ =
@@ -88,6 +89,7 @@ where
                     let _ = sender.send(result);
                 }
                 PersistenceAction::SaveBlocks(blocks, sender) => {
+                    debug!(target: "engine::persistence", "Received save block action");
                     let result = self.on_save_blocks(blocks)?;
                     let result_number = result.map(|r| r.number);
 
@@ -107,14 +109,22 @@ where
                     }
                 }
                 PersistenceAction::SaveFinalizedBlock(finalized_block) => {
+                    debug!(target: "engine::persistence", ?finalized_block, "start save finalized");
                     let provider = self.provider.database_provider_rw()?;
+                    debug!(target: "engine::persistence", ?finalized_block, "accquire provider");
                     provider.save_finalized_block_number(finalized_block)?;
+                    debug!(target: "engine::persistence", ?finalized_block, "saved finalized block");
                     provider.commit()?;
+                    debug!(target: "engine::persistence", ?finalized_block, "finalized done");
                 }
                 PersistenceAction::SaveSafeBlock(safe_block) => {
+                    debug!(target: "engine::persistence", ?safe_block, "start save safe");
                     let provider = self.provider.database_provider_rw()?;
+                    debug!(target: "engine::persistence", ?safe_block, "acquired db provider");
                     provider.save_safe_block_number(safe_block)?;
+                    debug!(target: "engine::persistence", ?safe_block, "saved safe block");
                     provider.commit()?;
+                    debug!(target: "engine::persistence", ?safe_block, "save safe done");
                 }
             }
         }
@@ -155,8 +165,18 @@ where
         if last_block_hash_num.is_some() {
             let provider_rw = self.provider.database_provider_rw()?;
 
+            let start_save = Instant::now();
+            debug!(target: "engine::persistence", ?last_block_hash_num, "Saving blocks to disk");
             provider_rw.save_blocks(blocks)?;
+            let duration_save = start_save.elapsed();
+            self.metrics.save_duration_seconds.record(duration_save);
+
+            debug!(target: "engine::persistence", ?last_block_hash_num, "Committing saved blocks to disk");
+            let start_commit = Instant::now();
             provider_rw.commit()?;
+
+            self.metrics.commit_duration_seconds.record(start_commit.elapsed());
+            debug!(target: "engine::persistence", ?last_block_hash_num, duration_save=?duration_save, duration_commit=?start_commit.elapsed(), "commited save blocks");
         }
 
         debug!(target: "engine::persistence", first=?first_block_hash, last=?last_block_hash, "Saved range of blocks");
