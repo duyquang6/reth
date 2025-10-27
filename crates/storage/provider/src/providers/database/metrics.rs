@@ -44,6 +44,8 @@ pub(crate) enum Action {
     InsertHeaderNumbers,
     InsertBlockBodyIndices,
     InsertTransactionBlocks,
+    InsertTransactionSenders,
+    InsertTransactionHashNumbers,
     GetNextTxNum,
 }
 
@@ -70,6 +72,24 @@ struct DatabaseProviderMetrics {
     insert_tx_blocks: Histogram,
     /// Duration of get next tx num
     get_next_tx_num: Histogram,
+    /// Duration of get next tx num
+    insert_tx_meta: Histogram,
+    /// Duration of collect tx meta
+    collect_tx_meta: Histogram,
+    /// Duration of insert transaction senders
+    insert_tx_senders: Histogram,
+    /// Duration of insert transaction hash numbers
+    insert_tx_hash_numbers: Histogram,
+    /// Duration of update history indices
+    update_history_indices: Histogram,
+    /// Duration of changed accounts and blocks with range
+    changed_accounts_and_blocks: Histogram,
+    /// Duration of insert account history index
+    insert_account_history_index: Histogram,
+    /// Duration of changed storages and blocks with range
+    changed_storages_and_blocks: Histogram,
+    /// Duration of insert storage history index
+    insert_storage_history_index: Histogram,
 }
 
 impl DatabaseProviderMetrics {
@@ -85,6 +105,8 @@ impl DatabaseProviderMetrics {
             Action::InsertBlockBodyIndices => self.insert_block_body_indices.record(duration),
             Action::InsertTransactionBlocks => self.insert_tx_blocks.record(duration),
             Action::GetNextTxNum => self.get_next_tx_num.record(duration),
+            Action::InsertTransactionSenders => self.insert_tx_senders.record(duration),
+            Action::InsertTransactionHashNumbers => self.insert_tx_hash_numbers.record(duration),
         }
     }
 }

@@ -7996,6 +7996,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.17",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -10716,6 +10717,7 @@ dependencies = [
  "derive_more",
  "hash-db",
  "itertools 0.14.0",
+ "metrics",
  "nybbles",
  "plain_hasher",
  "proptest",

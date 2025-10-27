@@ -20,6 +20,7 @@ use reth_storage_api::StateProviderBox;
 use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use tokio::sync::{broadcast, watch};
+use tracing::debug;
 
 /// Size of the broadcast channel used to notify canonical state events.
 const CANON_STATE_NOTIFICATION_CHANNEL_SIZE: usize = 256;
@@ -262,9 +263,15 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
         R: IntoIterator<Item = ExecutedBlock<N>>,
     {
         {
+            debug!(target: "chain-state", "start update blocks");
             // acquire locks, starting with the numbers lock
+            debug!(target: "chain-state", "start acquire numbers lock");
             let mut numbers = self.inner.in_memory_state.numbers.write();
+            debug!(target: "chain-state", "acquired numbers lock");
+
+            debug!(target: "chain-state", "start acquire blocks lock");
             let mut blocks = self.inner.in_memory_state.blocks.write();
+            debug!(target: "chain-state", "acquired blocks lock");
 
             // we first remove the blocks from the reorged chain
             for block in reorged {
@@ -275,6 +282,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
             }
 
             // insert the new blocks
+            debug!(target: "chain-state", "start insert new blocks");
             for block in new_blocks {
                 let parent = blocks.get(&block.recovered_block().parent_hash()).cloned();
                 let block_state = BlockState::with_parent(block, parent);
@@ -285,6 +293,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
                 blocks.insert(hash, Arc::new(block_state));
                 numbers.insert(number, hash);
             }
+            debug!(target: "chain-state", "inserted new blocks");
 
             // remove the pending state
             self.inner.in_memory_state.pending.send_modify(|p| {
@@ -318,7 +327,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
         {
             if self.inner.in_memory_state.blocks.read().get(&persisted_num_hash.hash).is_none() {
                 // do nothing
-                return
+                return;
             }
         }
 
@@ -542,7 +551,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
             if let Some(tx) =
                 block_state.block_ref().recovered_block().body().transaction_by_hash(&hash)
             {
-                return Some(tx.clone())
+                return Some(tx.clone());
             }
         }
         None
@@ -818,31 +827,97 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
     pub fn to_chain_notification(&self) -> CanonStateNotification<N> {
         match self {
             Self::Commit { new } => {
-                let new = Arc::new(new.iter().fold(Chain::default(), |mut chain, exec| {
-                    chain.append_block(
-                        exec.recovered_block().clone(),
-                        exec.execution_outcome().clone(),
+                // Optimize for the common single-block case
+                if new.len() == 1 {
+                    let exec = &new[0];
+                    // For single block, use Arc::clone for both blocks and execution outcome (zero clones!)
+                    let chain = Chain::from_arc(
+                        core::iter::once(Arc::clone(&exec.recovered_block)),
+                        Arc::clone(&exec.execution_output),
+                        None,
                     );
-                    chain
-                }));
-                CanonStateNotification::Commit { new }
+                    return CanonStateNotification::Commit { new: Arc::new(chain) };
+                }
+
+                // Multi-block case: need to merge execution outcomes
+                let mut blocks = BTreeMap::new();
+                let mut execution_outcome = ExecutionOutcome::default();
+
+                for exec in new {
+                    // Just clone the Arc pointer, not the block data!
+                    blocks.insert(
+                        exec.recovered_block.header().number(),
+                        Arc::clone(&exec.recovered_block),
+                    );
+                    // Need to clone execution outcome to merge multiple ones
+                    execution_outcome
+                        .extend(Arc::unwrap_or_clone(Arc::clone(&exec.execution_output)));
+                }
+
+                let chain = Chain::from_arc_blocks(blocks.into_values(), execution_outcome, None);
+                CanonStateNotification::Commit { new: Arc::new(chain) }
             }
             Self::Reorg { new, old } => {
-                let new = Arc::new(new.iter().fold(Chain::default(), |mut chain, exec| {
-                    chain.append_block(
-                        exec.recovered_block().clone(),
-                        exec.execution_outcome().clone(),
-                    );
-                    chain
-                }));
-                let old = Arc::new(old.iter().fold(Chain::default(), |mut chain, exec| {
-                    chain.append_block(
-                        exec.recovered_block().clone(),
-                        exec.execution_outcome().clone(),
-                    );
-                    chain
-                }));
-                CanonStateNotification::Reorg { new, old }
+                // Helper to build chain from executed blocks with trie updates
+                let build_chain_with_trie = |blocks: &[ExecutedBlock<N>]| {
+                    // Optimize for single block case
+                    if blocks.len() == 1 {
+                        let exec = &blocks[0];
+                        return Chain::from_arc(
+                            core::iter::once(Arc::clone(&exec.recovered_block)),
+                            Arc::clone(&exec.execution_output),
+                            None,
+                        );
+                    }
+
+                    // Multi-block case
+                    let mut block_map = BTreeMap::new();
+                    let mut execution_outcome = ExecutionOutcome::default();
+
+                    for exec in blocks {
+                        block_map.insert(
+                            exec.recovered_block.header().number(),
+                            Arc::clone(&exec.recovered_block),
+                        );
+                        execution_outcome
+                            .extend(Arc::unwrap_or_clone(Arc::clone(&exec.execution_output)));
+                    }
+
+                    Chain::from_arc_blocks(block_map.into_values(), execution_outcome, None)
+                };
+
+                // Helper to build chain from executed blocks without trie updates
+                let build_chain = |blocks: &[ExecutedBlock<N>]| {
+                    // Optimize for single block case
+                    if blocks.len() == 1 {
+                        let exec = &blocks[0];
+                        return Chain::from_arc(
+                            core::iter::once(Arc::clone(&exec.recovered_block)),
+                            Arc::clone(&exec.execution_output),
+                            None,
+                        );
+                    }
+
+                    // Multi-block case
+                    let mut block_map = BTreeMap::new();
+                    let mut execution_outcome = ExecutionOutcome::default();
+
+                    for exec in blocks {
+                        block_map.insert(
+                            exec.recovered_block.header().number(),
+                            Arc::clone(&exec.recovered_block),
+                        );
+                        execution_outcome
+                            .extend(Arc::unwrap_or_clone(Arc::clone(&exec.execution_output)));
+                    }
+
+                    Chain::from_arc_blocks(block_map.into_values(), execution_outcome, None)
+                };
+
+                CanonStateNotification::Reorg {
+                    new: Arc::new(build_chain_with_trie(new)),
+                    old: Arc::new(build_chain(old)),
+                }
             }
         }
     }

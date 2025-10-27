@@ -32,6 +32,9 @@ nybbles = { workspace = true, features = ["rlp"] }
 # reth
 revm-database.workspace = true
 
+# metrics
+metrics.workspace = true
+
 # `serde` feature
 serde = { workspace = true, optional = true }
 

@@ -47,7 +47,7 @@ pub mod test_utils {
         database::Database, database_metrics::DatabaseMetrics, models::ClientVersion,
     };
     use reth_fs_util;
-    use reth_libmdbx::MaxReadTransactionDuration;
+    use reth_libmdbx::{MaxReadTransactionDuration, SyncMode};
     use std::{
         fmt::Formatter,
         path::{Path, PathBuf},

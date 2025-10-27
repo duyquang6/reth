@@ -1,3 +1,6 @@
+use std::time::Instant;
+
+use ::metrics::{histogram, Label};
 use crate::{utils::extend_sorted_vec, BranchNodeCompact, HashBuilder, Nibbles};
 use alloc::{
     collections::{btree_map::BTreeMap, btree_set::BTreeSet},
@@ -119,6 +122,7 @@ impl TrieUpdates {
     /// This allows us to reuse the allocated space. This allocates new space for the sorted
     /// updates, like `into_sorted`.
     pub fn drain_into_sorted(&mut self) -> TrieUpdatesSorted {
+        let start = Instant::now();
         let mut account_nodes = self
             .account_nodes
             .drain()
@@ -129,14 +133,35 @@ impl TrieUpdates {
             })
             .collect::<Vec<_>>();
 
+        histogram!(
+            "trie.common.updates.drain_into_sorted",
+            vec![Label::new("operation", "account_nodes_drain")]
+        )
+        .record(start.elapsed());
+
+        let start = Instant::now();
+
         account_nodes.extend(self.removed_nodes.drain().map(|path| (path, None)));
         account_nodes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
+        histogram!(
+            "trie.common.updates.drain_into_sorted",
+            vec![Label::new("operation", "account_nodes_extend_sort")]
+        )
+        .record(start.elapsed());
+
+        let start = Instant::now();
         let storage_tries = self
             .storage_tries
             .drain()
             .map(|(hashed_address, updates)| (hashed_address, updates.into_sorted()))
             .collect();
+        histogram!(
+            "trie.common.updates.drain_into_sorted",
+            vec![Label::new("operation", "storage_tries")]
+        )
+        .record(start.elapsed());
+        
         TrieUpdatesSorted { account_nodes, storage_tries }
     }
 

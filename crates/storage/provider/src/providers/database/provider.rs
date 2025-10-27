@@ -1,24 +1,11 @@
 use crate::{
-    changesets_utils::{
-        storage_trie_wiped_changeset_iter, StorageRevertsIter, StorageTrieCurrentValuesIter,
-    },
-    providers::{
-        database::{chain::ChainStorage, metrics},
-        static_file::StaticFileWriter,
-        NodeTypesForProvider, StaticFileProvider,
-    },
-    to_range,
-    traits::{
+    AccountReader, BlockBodyWriter, BlockExecutionWriter, BlockHashReader, BlockNumReader, BlockReader, BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter, DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider, HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef, OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit, StageCheckpointReader, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader, StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieReader, TrieWriter, changesets_utils::{
+        StorageRevertsIter, StorageTrieCurrentValuesIter, storage_trie_wiped_changeset_iter
+    }, providers::{
+        NodeTypesForProvider, StaticFileProvider, database::{chain::ChainStorage, metrics}, static_file::StaticFileWriter
+    }, to_range, traits::{
         AccountExtReader, BlockSource, ChangeSetReader, ReceiptProvider, StageCheckpointWriter,
-    },
-    AccountReader, BlockBodyWriter, BlockExecutionWriter, BlockHashReader, BlockNumReader,
-    BlockReader, BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter,
-    DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider,
-    HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef,
-    OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit,
-    StageCheckpointReader, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader,
-    StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
-    TransactionsProviderExt, TrieReader, TrieWriter,
+    }
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta, TxHashRef},
@@ -66,8 +53,8 @@ use reth_trie::{
         InMemoryTrieCursor, InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory,
         TrieCursorIter,
     },
-    updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
-    BranchNodeCompact, HashedPostStateSorted, Nibbles, StoredNibbles, StoredNibblesSubKey,
+    updates::{StorageTrieUpdatesSorted, TrieUpdates, TrieUpdatesSorted},
+    BranchNodeCompact, HashedPostState, HashedPostStateSorted, Nibbles, StoredNibbles, StoredNibblesSubKey,
     TrieChangeSetsEntry,
 };
 use reth_trie_db::{
@@ -76,12 +63,14 @@ use reth_trie_db::{
 use revm_database::states::{
     PlainStateReverts, PlainStorageChangeset, PlainStorageRevert, StateChangeset,
 };
+use ::metrics::{gauge, histogram, Label};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::{Deref, DerefMut, Not, Range, RangeBounds, RangeFrom, RangeInclusive},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tracing::{debug, trace};
 
@@ -176,10 +165,10 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
     ) -> ProviderResult<Box<dyn StateProvider + 'a>> {
         let mut block_number =
             self.block_number(block_hash)?.ok_or(ProviderError::BlockHashNotFound(block_hash))?;
-        if block_number == self.best_block_number().unwrap_or_default() &&
-            block_number == self.last_block_number().unwrap_or_default()
+        if block_number == self.best_block_number().unwrap_or_default()
+            && block_number == self.last_block_number().unwrap_or_default()
         {
-            return Ok(Box::new(LatestStateProviderRef::new(self)))
+            return Ok(Box::new(LatestStateProviderRef::new(self)));
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
@@ -260,11 +249,82 @@ impl<TX, N: NodeTypes> AsRef<Self> for DatabaseProvider<TX, N> {
 }
 
 impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
-    /// Writes executed blocks and state to storage.
+    // pub fn save_blocks(&self, blocks: Vec<ExecutedBlock<N::Primitives>>) -> ProviderResult<()> {
+    //     if blocks.is_empty() {
+    //         debug!(target: "providers::db", "Attempted to write empty block range");
+    //         return Ok(());
+    //     }
+
+    //     // NOTE: checked non-empty above
+    //     let first_block = blocks.first().unwrap().recovered_block();
+
+    //     let last_block = blocks.last().unwrap().recovered_block();
+    //     let first_number = first_block.number();
+    //     let last_block_number = last_block.number();
+
+    //     debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
+
+    //     // Record block count metric (gauge for current batch size)
+    //     gauge!("storage.providers.database.save_blocks.count", vec![]).set(blocks.len() as f64);
+
+    //     let mut durations_recorder = metrics::DurationsRecorder::default();
+
+    //     // TODO: Do performant / batched writes for each type of object
+    //     // instead of a loop over all blocks,
+    //     // meaning:
+    //     //  * blocks
+    //     //  * state
+    //     //  * hashed state
+    //     //  * trie updates (cannot naively extend, need helper)
+    //     //  * indices (already done basically)
+    //     // Insert the blocks
+    //     let mut sum_write_state_time = Duration::from_secs(0);
+    //     for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in
+    //         blocks
+    //     {
+    //         let block_number = recovered_block.number();
+    //         self.insert_block(Arc::unwrap_or_clone(recovered_block))?;
+
+    //         // Write state and changesets to the database.
+    //         // Must be written after blocks because of the receipt lookup.
+    //         let write_state_start = Instant::now();
+    //         self.write_state(&execution_output, OriginalValuesKnown::No)?;
+    //         sum_write_state_time += write_state_start.elapsed();
+
+    //         // insert hashes and intermediate merkle nodes
+    //         self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
+    //         debug!(target: "providers::db", ?block_number, "Inserted hashed state");
+
+    //         // sort trie updates and insert changesets
+    //         // 83ms
+    //         let trie_updates_sorted = (*trie_updates).clone().into_sorted();
+    //         self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
+    //         self.write_trie_updates_sorted(&trie_updates_sorted)?;
+    //         debug!(target: "providers::db", ?block_number, "inserted tries, insert block done");
+    //         durations_recorder.record_relative(metrics::Action::InsertBlock);
+    //     }
+
+    //     histogram!("storage.providers.database.save_blocks.write_state_time").record(sum_write_state_time);
+
+    //     // update history indices
+    //     self.update_history_indices(first_number..=last_block_number)?;
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Updated history indices");
+
+    //     durations_recorder.record_relative(metrics::Action::UpdateHistoryIndices);
+
+    //     // Update pipeline progress
+    //     self.update_pipeline_stages(last_block_number, false)?;
+
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
+
+    //     Ok(())
+    // }
+
+
     pub fn save_blocks(&self, blocks: Vec<ExecutedBlock<N::Primitives>>) -> ProviderResult<()> {
         if blocks.is_empty() {
             debug!(target: "providers::db", "Attempted to write empty block range");
-            return Ok(())
+            return Ok(());
         }
 
         // NOTE: checked non-empty above
@@ -276,6 +336,11 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
         debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
 
+        // Record block count metric (gauge for current batch size)
+        gauge!("storage.providers.database.save_blocks.count", vec![]).set(blocks.len() as f64);
+
+        let mut durations_recorder = metrics::DurationsRecorder::default();
+
         // TODO: Do performant / batched writes for each type of object
         // instead of a loop over all blocks,
         // meaning:
@@ -284,28 +349,125 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         //  * hashed state
         //  * trie updates (cannot naively extend, need helper)
         //  * indices (already done basically)
-        // Insert the blocks
-        for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in
-            blocks
-        {
-            let block_number = recovered_block.number();
-            self.insert_block(Arc::unwrap_or_clone(recovered_block))?;
+        
+        // Collect execution outcomes for batch merging
+        let mut execution_outcomes: Vec<ExecutionOutcome<ReceiptTy<N>>> = Vec::with_capacity(blocks.len());
+        let mut block_data: Vec<(Arc<RecoveredBlock<BlockTy<N>>>, Arc<HashedPostState>, Arc<TrieUpdates>)> = 
+            Vec::with_capacity(blocks.len());
 
-            // Write state and changesets to the database.
-            // Must be written after blocks because of the receipt lookup.
-            self.write_state(&execution_output, OriginalValuesKnown::No)?;
-
-            // insert hashes and intermediate merkle nodes
-            self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
-
-            // sort trie updates and insert changesets
-            let trie_updates_sorted = (*trie_updates).clone().into_sorted();
-            self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
-            self.write_trie_updates_sorted(&trie_updates_sorted)?;
+        // First pass: collect all data
+        // NOTE: Blocks must be in sequential order for correct state merging
+        for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in blocks {
+            // Unwrap Arc to get owned ExecutionOutcome for merging
+            execution_outcomes.push(Arc::unwrap_or_clone(execution_output));
+            block_data.push((recovered_block, hashed_state, trie_updates));
         }
 
+        // Merge all execution outcomes into a single batch
+        let mut merged_outcome = if let Some(first_outcome) = execution_outcomes.first() {
+            first_outcome.clone()
+        } else {
+            return Ok(());
+        };
+
+        // Extend with all subsequent outcomes
+        for outcome in execution_outcomes.into_iter().skip(1) {
+            merged_outcome.extend(outcome);
+        }
+
+        // Insert all blocks first (required before state write for receipt lookup)
+        for (recovered_block, _, _) in &block_data {
+            let block_number = recovered_block.number();
+            debug!(target: "providers::db", ?block_number, "start insert block");
+            self.insert_block(Arc::unwrap_or_clone(recovered_block.clone()))?;
+        }
+
+        // Write merged state once as a batch
+        debug!(target: "providers::db", block_count = %block_data.len(), "Writing merged state for batch");
+        let write_state_start = Instant::now();
+        self.write_state(&merged_outcome, OriginalValuesKnown::No)?;
+        histogram!("storage.providers.database.save_blocks.write_state_time").record(write_state_start.elapsed());
+        debug!(target: "providers::db", block_count = %block_data.len(), "write state done");
+
+        // Merge all hashed states into a single batch (aggregate unsorted first, then sort once)
+        let mut merged_hashed_state = if let Some((_, first_hashed_state, _)) = block_data.first() {
+            Arc::unwrap_or_clone(first_hashed_state.clone())
+        } else {
+            return Ok(());
+        };
+
+        // Extend with all subsequent hashed states (merge unsorted - more efficient)
+        // Later entries take precedence (picking latest records)
+        for (_, hashed_state, _) in block_data.iter().skip(1) {
+            let state = Arc::unwrap_or_clone(hashed_state.clone());
+            merged_hashed_state.extend(state);
+        }
+
+        // Sort once after merging (instead of sorting each state individually)
+        let merged_hashed_state_sorted = merged_hashed_state.into_sorted();
+
+        // Write merged hashed state once as a batch
+        debug!(target: "providers::db", block_count = %block_data.len(), "Writing merged hashed state for batch");
+        let write_hashed_state_start = Instant::now();
+        self.write_hashed_state(&merged_hashed_state_sorted)?;
+        histogram!("storage.providers.database.save_blocks.write_hashed_state_time").record(write_hashed_state_start.elapsed());
+        debug!(target: "providers::db", block_count = %block_data.len(), "write hashed state done");
+
+        // Write changesets for each block with cumulative overlay (overlay = state before that block)
+        let start_write_trie = Instant::now();
+        let mut write_trie_changeset_duration = Duration::from_secs(0);
+        let mut cumulative_overlay_sorted: Option<TrieUpdatesSorted> = None;
+        
+        for (recovered_block, _, trie_updates) in &block_data {
+            let block_number = recovered_block.number();
+            
+            // Use cached sorted overlay (state before this block)
+            let overlay_sorted = cumulative_overlay_sorted.as_ref();
+            
+            // Get owned trie updates and sort (into_sorted consumes the value)
+            let sort_trie_updates_start = Instant::now();
+            let trie_updates_sorted = Arc::unwrap_or_clone(trie_updates.clone()).into_sorted();
+            histogram!("storage.providers.database.save_blocks.sort_trie_updates_time").record(sort_trie_updates_start.elapsed());
+
+            let write_changesets_start = Instant::now();
+            // Write changesets with overlay
+            self.write_trie_changesets(
+                block_number,
+                &trie_updates_sorted,
+                overlay_sorted,
+            )?;
+            write_trie_changeset_duration += write_changesets_start.elapsed();
+
+            // Accumulate this block's changes for next block's overlay (extend sorted version directly - no conversion needed)
+            match &mut cumulative_overlay_sorted {
+                Some(overlay) => {
+                    overlay.extend_ref(&trie_updates_sorted);
+                }
+                None => {
+                    // Move instead of clone - we're done using trie_updates_sorted after write_trie_changesets
+                    cumulative_overlay_sorted = Some(trie_updates_sorted);
+                }
+            }
+        }
+        histogram!("storage.providers.database.save_blocks.write_trie_changesets_time").record(write_trie_changeset_duration);
+        debug!(target: "providers::db", block_count = %block_data.len(), range = ?first_number..=last_block_number, "inserted trie changesets for batch");
+
+        // Use cumulative overlay for final write (already sorted and contains all merged updates)
+        let merge_trie_start = Instant::now();
+        let merged_trie_updates_sorted = cumulative_overlay_sorted.unwrap_or_default();
+        histogram!("storage.providers.database.save_blocks.merge_sort_trie_updates_time").record(merge_trie_start.elapsed());
+
+        // Write merged trie nodes once (final state after all blocks)
+        let write_trie_updates_start = Instant::now();
+        self.write_trie_updates_sorted(&merged_trie_updates_sorted)?;
+        histogram!("storage.providers.database.save_blocks.write_trie_updates_sorted_time").record(write_trie_updates_start.elapsed());
+        debug!(target: "providers::db", block_count = %block_data.len(), "write trie updates sorted done");
+
+        histogram!("storage.providers.database.save_blocks.write_trie_total_time").record(start_write_trie.elapsed());
+    
         // update history indices
         self.update_history_indices(first_number..=last_block_number)?;
+        debug!(target: "providers::db", range = ?first_number..=last_block_number, "Updated history indices");
 
         // Update pipeline progress
         self.update_pipeline_stages(last_block_number, false)?;
@@ -314,6 +476,507 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
         Ok(())
     }
+
+    // pub fn save_blocks(&self, blocks: Vec<ExecutedBlock<N::Primitives>>) -> ProviderResult<()> {
+    //     if blocks.is_empty() {
+    //         debug!(target: "providers::db", "Attempted to write empty block range");
+    //         return Ok(());
+    //     }
+
+    //     // NOTE: checked non-empty above
+    //     let first_block = blocks.first().unwrap().recovered_block();
+
+    //     let last_block = blocks.last().unwrap().recovered_block();
+    //     let first_number = first_block.number();
+    //     let last_block_number = last_block.number();
+
+    //     debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
+
+    //     // Record block count metric (gauge for current batch size)
+    //     gauge!("storage.providers.database.save_blocks.count", vec![]).set(blocks.len() as f64);
+
+    //     let mut durations_recorder = metrics::DurationsRecorder::default();
+
+    //     // TODO: Do performant / batched writes for each type of object
+    //     // instead of a loop over all blocks,
+    //     // meaning:
+    //     //  * blocks
+    //     //  * state
+    //     //  * hashed state
+    //     //  * trie updates (cannot naively extend, need helper)
+    //     //  * indices (already done basically)
+        
+    //     // Collect execution outcomes for batch merging
+    //     let mut execution_outcomes: Vec<ExecutionOutcome<ReceiptTy<N>>> = Vec::with_capacity(blocks.len());
+    //     let mut block_data: Vec<(Arc<RecoveredBlock<BlockTy<N>>>, Arc<HashedPostState>, Arc<TrieUpdates>)> = 
+    //         Vec::with_capacity(blocks.len());
+
+    //     // First pass: collect all data
+    //     // NOTE: Blocks must be in sequential order for correct state merging
+    //     for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in blocks {
+    //         // Unwrap Arc to get owned ExecutionOutcome for merging
+    //         execution_outcomes.push(Arc::unwrap_or_clone(execution_output));
+    //         block_data.push((recovered_block, hashed_state, trie_updates));
+    //     }
+
+    //     // Merge all execution outcomes into a single batch
+    //     let mut merged_outcome = if let Some(first_outcome) = execution_outcomes.first() {
+    //         first_outcome.clone()
+    //     } else {
+    //         return Ok(());
+    //     };
+
+    //     // Extend with all subsequent outcomes
+    //     for outcome in execution_outcomes.into_iter().skip(1) {
+    //         merged_outcome.extend(outcome);
+    //     }
+
+    //     // Insert all blocks first (required before state write for receipt lookup)
+    //     for (recovered_block, _, _) in &block_data {
+    //         let block_number = recovered_block.number();
+    //         debug!(target: "providers::db", ?block_number, "start insert block");
+    //         self.insert_block(Arc::unwrap_or_clone(recovered_block.clone()))?;
+    //     }
+
+    //     // Write merged state once as a batch
+    //     debug!(target: "providers::db", block_count = %block_data.len(), "Writing merged state for batch");
+    //     let write_state_start = Instant::now();
+    //     self.write_state(&merged_outcome, OriginalValuesKnown::No)?;
+    //     histogram!("storage.providers.database.save_blocks.write_state_time").record(write_state_start.elapsed());
+    //     debug!(target: "providers::db", block_count = %block_data.len(), "write state done");
+
+    //     // Merge all hashed states into a single batch (aggregate unsorted first, then sort once)
+    //     let mut merged_hashed_state = if let Some((_, first_hashed_state, _)) = block_data.first() {
+    //         Arc::unwrap_or_clone(first_hashed_state.clone())
+    //     } else {
+    //         return Ok(());
+    //     };
+
+    //     // Extend with all subsequent hashed states (merge unsorted - more efficient)
+    //     // Later entries take precedence (picking latest records)
+    //     for (_, hashed_state, _) in block_data.iter().skip(1) {
+    //         let state = Arc::unwrap_or_clone(hashed_state.clone());
+    //         merged_hashed_state.extend(state);
+    //     }
+
+    //     // Sort once after merging (instead of sorting each state individually)
+    //     let merged_hashed_state_sorted = merged_hashed_state.into_sorted();
+
+    //     // Write merged hashed state once as a batch
+    //     debug!(target: "providers::db", block_count = %block_data.len(), "Writing merged hashed state for batch");
+    //     let write_hashed_state_start = Instant::now();
+    //     self.write_hashed_state(&merged_hashed_state_sorted)?;
+    //     histogram!("storage.providers.database.save_blocks.write_hashed_state_time").record(write_hashed_state_start.elapsed());
+    //     debug!(target: "providers::db", block_count = %block_data.len(), "write hashed state done");
+
+    //     // Process trie updates for each block (cannot be batched easily)
+    //     let start_write_trie = Instant::now();
+    //     for (recovered_block, _hashed_state, trie_updates) in block_data {
+    //         let block_number = recovered_block.number();
+            
+    //         // sort trie updates and insert changesets
+    //         // 83ms
+    //         let trie_updates_sorted = (*trie_updates).clone().into_sorted();
+    //         self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
+    //         self.write_trie_updates_sorted(&trie_updates_sorted)?;
+    //         debug!(target: "providers::db", ?block_number, "inserted tries, insert block done");
+    //         durations_recorder.record_relative(metrics::Action::InsertBlock);
+    //     }
+
+    //     histogram!("storage.providers.database.save_blocks.write_trie_total_time").record(start_write_trie.elapsed());
+
+    //     // update history indices
+    //     self.update_history_indices(first_number..=last_block_number)?;
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Updated history indices");
+
+    //     durations_recorder.record_relative(metrics::Action::UpdateHistoryIndices);
+
+    //     // Update pipeline progress
+    //     self.update_pipeline_stages(last_block_number, false)?;
+
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
+
+    //     Ok(())
+    // }
+
+    // pub fn save_blocks_write_hashed_state(&self, blocks: Vec<ExecutedBlock<N::Primitives>>) -> ProviderResult<()> {
+    //     if blocks.is_empty() {
+    //         debug!(target: "providers::db", "Attempted to write empty block range");
+    //         return Ok(());
+    //     }
+
+    //     // NOTE: checked non-empty above
+    //     let first_block = blocks.first().unwrap().recovered_block();
+
+    //     let last_block = blocks.last().unwrap().recovered_block();
+    //     let first_number = first_block.number();
+    //     let last_block_number = last_block.number();
+
+    //     debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
+
+    //     // Record block count metric (gauge for current batch size)
+    //     gauge!("storage.providers.database.save_blocks.count", vec![]).set(blocks.len() as f64);
+
+    //     let mut durations_recorder = metrics::DurationsRecorder::default();
+
+    //     // TODO: Do performant / batched writes for each type of object
+    //     // instead of a loop over all blocks,
+    //     // meaning:
+    //     //  * blocks
+    //     //  * state
+    //     //  * hashed state
+    //     //  * trie updates (cannot naively extend, need helper)
+    //     //  * indices (already done basically)
+        
+    //     // Collect execution outcomes for batch merging
+    //     let mut execution_outcomes: Vec<ExecutionOutcome<ReceiptTy<N>>> = Vec::with_capacity(blocks.len());
+    //     let mut block_data: Vec<(Arc<RecoveredBlock<BlockTy<N>>>, Arc<HashedPostState>, Arc<TrieUpdates>)> = 
+    //         Vec::with_capacity(blocks.len());
+
+    //     // First pass: collect all data
+    //     // NOTE: Blocks must be in sequential order for correct state merging
+    //     for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in blocks {
+    //         // Unwrap Arc to get owned ExecutionOutcome for merging
+    //         execution_outcomes.push(Arc::unwrap_or_clone(execution_output));
+    //         block_data.push((recovered_block, hashed_state, trie_updates));
+    //     }
+
+    //     // Merge all execution outcomes into a single batch
+    //     let mut merged_outcome = if let Some(first_outcome) = execution_outcomes.first() {
+    //         first_outcome.clone()
+    //     } else {
+    //         return Ok(());
+    //     };
+
+    //     // Extend with all subsequent outcomes
+    //     for outcome in execution_outcomes.into_iter().skip(1) {
+    //         merged_outcome.extend(outcome);
+    //     }
+
+    //     // Insert all blocks first (required before state write for receipt lookup)
+    //     for (recovered_block, _, _) in &block_data {
+    //         let block_number = recovered_block.number();
+    //         debug!(target: "providers::db", ?block_number, "start insert block");
+    //         self.insert_block(Arc::unwrap_or_clone(recovered_block.clone()))?;
+    //     }
+
+    //     // Write merged state once as a batch
+    //     debug!(target: "providers::db", block_count = %block_data.len(), "Writing merged state for batch");
+    //     let write_state_start = Instant::now();
+    //     self.write_state(&merged_outcome, OriginalValuesKnown::No)?;
+    //     histogram!("storage.providers.database.save_blocks.write_state_time").record(write_state_start.elapsed());
+    //     debug!(target: "providers::db", block_count = %block_data.len(), "write state done");
+
+    //     let mut write_hashed_state_total = Duration::from_secs(0);
+    //     // Process hashed state and trie updates for each block
+    //     for (recovered_block, hashed_state, trie_updates) in block_data {
+    //         let block_number = recovered_block.number();
+            
+    //         // insert hashes and intermediate merkle nodes
+    //         // 34ms
+    //         let write_hashed_state_start = Instant::now();
+    //         self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
+    //         write_hashed_state_total += write_hashed_state_start.elapsed();
+    //         debug!(target: "providers::db", ?block_number, "Inserted hashed state");
+
+    //         // sort trie updates and insert changesets
+    //         // 83ms
+    //         let trie_updates_sorted = (*trie_updates).clone().into_sorted();
+    //         self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
+    //         self.write_trie_updates_sorted(&trie_updates_sorted)?;
+    //         debug!(target: "providers::db", ?block_number, "inserted tries, insert block done");
+    //         durations_recorder.record_relative(metrics::Action::InsertBlock);
+    //     }
+
+    //     histogram!("storage.providers.database.save_blocks.write_hashed_state_time").record(write_hashed_state_total);
+
+    //     // update history indices
+    //     self.update_history_indices(first_number..=last_block_number)?;
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Updated history indices");
+
+    //     durations_recorder.record_relative(metrics::Action::UpdateHistoryIndices);
+
+    //     // Update pipeline progress
+    //     self.update_pipeline_stages(last_block_number, false)?;
+
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
+
+    //     Ok(())
+    // }
+
+    // pub fn save_blocks_write_state(&self, blocks: Vec<ExecutedBlock<N::Primitives>>) -> ProviderResult<()> {
+    //     if blocks.is_empty() {
+    //         debug!(target: "providers::db", "Attempted to write empty block range");
+    //         return Ok(());
+    //     }
+
+    //     // NOTE: checked non-empty above
+    //     let first_block = blocks.first().unwrap().recovered_block();
+
+    //     let last_block = blocks.last().unwrap().recovered_block();
+    //     let first_number = first_block.number();
+    //     let last_block_number = last_block.number();
+
+    //     debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
+
+    //     // Record block count metric (gauge for current batch size)
+    //     gauge!("storage.providers.database.save_blocks.count", vec![]).set(blocks.len() as f64);
+
+    //     let mut durations_recorder = metrics::DurationsRecorder::default();
+
+    //     // TODO: Do performant / batched writes for each type of object
+    //     // instead of a loop over all blocks,
+    //     // meaning:
+    //     //  * blocks
+    //     //  * state
+    //     //  * hashed state
+    //     //  * trie updates (cannot naively extend, need helper)
+    //     //  * indices (already done basically)
+        
+    //     // Collect execution outcomes for batch merging
+    //     let mut execution_outcomes: Vec<ExecutionOutcome<ReceiptTy<N>>> = Vec::with_capacity(blocks.len());
+    //     let mut block_data: Vec<(Arc<RecoveredBlock<BlockTy<N>>>, Arc<HashedPostState>, Arc<TrieUpdates>)> = 
+    //         Vec::with_capacity(blocks.len());
+
+    //     // First pass: collect all data
+    //     for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in blocks {
+    //         // Unwrap Arc to get owned ExecutionOutcome for merging
+    //         execution_outcomes.push(Arc::unwrap_or_clone(execution_output));
+    //         block_data.push((recovered_block, hashed_state, trie_updates));
+    //     }
+
+    //     // Merge all execution outcomes into a single batch
+    //     let mut merged_outcome = if let Some(first_outcome) = execution_outcomes.first() {
+    //         first_outcome.clone()
+    //     } else {
+    //         return Ok(());
+    //     };
+
+    //     // Extend with all subsequent outcomes
+    //     for outcome in execution_outcomes.into_iter().skip(1) {
+    //         merged_outcome.extend(outcome);
+    //     }
+
+    //     // Insert all blocks first (required before state write for receipt lookup)
+    //     for (recovered_block, _, _) in &block_data {
+    //         let block_number = recovered_block.number();
+    //         debug!(target: "providers::db", ?block_number, "start insert block");
+    //         self.insert_block(Arc::unwrap_or_clone(recovered_block.clone()))?;
+    //     }
+
+    //     // Write merged state once as a batch
+    //     debug!(target: "providers::db", block_count = %block_data.len(), "Writing merged state for batch");
+    //     self.write_state(&merged_outcome, OriginalValuesKnown::No)?;
+    //     debug!(target: "providers::db", block_count = %block_data.len(), "write state done");
+
+    //     // Process hashed state and trie updates for each block
+    //     for (recovered_block, hashed_state, trie_updates) in block_data {
+    //         let block_number = recovered_block.number();
+            
+    //         // insert hashes and intermediate merkle nodes
+    //         // 34ms
+    //         self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
+    //         debug!(target: "providers::db", ?block_number, "Inserted hashed state");
+
+    //         // sort trie updates and insert changesets
+    //         // 83ms
+    //         let trie_updates_sorted = (*trie_updates).clone().into_sorted();
+    //         self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
+    //         self.write_trie_updates_sorted(&trie_updates_sorted)?;
+    //         debug!(target: "providers::db", ?block_number, "inserted tries, insert block done");
+    //         durations_recorder.record_relative(metrics::Action::InsertBlock);
+    //     }
+
+    //     // update history indices
+    //     self.update_history_indices(first_number..=last_block_number)?;
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Updated history indices");
+
+    //     durations_recorder.record_relative(metrics::Action::UpdateHistoryIndices);
+
+    //     // Update pipeline progress
+    //     self.update_pipeline_stages(last_block_number, false)?;
+
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
+
+    //     Ok(())
+    // }
+
+    /// Writes executed blocks and state to storage.
+    // pub fn batch_save_blocks(&self, blocks: Vec<ExecutedBlock<N::Primitives>>) -> ProviderResult<()> {
+    //     if blocks.is_empty() {
+    //         debug!(target: "providers::db", "Attempted to write empty block range");
+    //         return Ok(());
+    //     }
+
+    //     // NOTE: checked non-empty above
+    //     let first_block = blocks.first().unwrap().recovered_block();
+
+    //     let last_block = blocks.last().unwrap().recovered_block();
+    //     let first_number = first_block.number();
+    //     let last_block_number = last_block.number();
+
+    //     debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
+
+    //     let mut durations_recorder = metrics::DurationsRecorder::default();
+    //     // Collect header numbers for batch insertion
+    //     let start_at = Instant::now();
+    //     let mut header_numbers_to_insert: Vec<(BlockHash, BlockNumber)> = blocks
+    //         .iter()
+    //         .map(|b| {
+    //             let block = b.recovered_block();
+    //             (block.hash(), block.number())
+    //         })
+    //         .collect();
+
+    //     // Sort by hash for better cache locality
+    //     header_numbers_to_insert.sort_by_key(|(hash, _)| *hash);
+
+    //     debug!(target: "providers::db", block_count = %blocks.len(), duration = ?start_at.elapsed(), "Sorted header numbers");
+    //     let start_at = Instant::now();
+    //     // Batch insert header numbers using cursor
+    //     if !header_numbers_to_insert.is_empty() {
+    //         let mut cursor = self.tx.cursor_write::<tables::HeaderNumbers>()?;
+    //         // Use insert since hashes are not globally sorted relative to existing entries
+    //         for (hash, block_number) in header_numbers_to_insert {
+    //             cursor.insert(hash, &block_number)?;
+    //             durations_recorder.record_relative(metrics::Action::InsertHeaderNumbers);
+    //         }
+    //     }
+    //     debug!(target: "providers::db", block_count = %blocks.len(), duration = ?start_at.elapsed(), "Inserted header numbers");
+
+    //     // Collect transaction senders and hash numbers for batch insertion across all blocks
+    //     let should_insert_senders =
+    //         self.prune_modes.sender_recovery.as_ref().is_none_or(|m| !m.is_full());
+    //     let should_insert_tx_lookup =
+    //         self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full());
+
+    //     let mut senders_to_insert = Vec::new();
+    //     let mut tx_lookup_to_insert = Vec::new();
+    //     let mut next_tx_num = self
+    //         .tx
+    //         .cursor_read::<tables::TransactionBlocks>()?
+    //         .last()?
+    //         .map(|(n, _)| n + 1)
+    //         .unwrap_or_default();
+
+    //     // Collect all transaction senders and hash numbers
+    //     let start_at = Instant::now();
+    //     for block in &blocks {
+    //         let recovered_block = block.recovered_block();
+    //         for (transaction, sender) in
+    //             recovered_block.body().transactions_iter().zip(recovered_block.senders_iter())
+    //         {
+    //             if should_insert_senders {
+    //                 senders_to_insert.push((next_tx_num, *sender));
+    //             }
+    //             if should_insert_tx_lookup {
+    //                 let hash = transaction.tx_hash();
+    //                 tx_lookup_to_insert.push((*hash, next_tx_num));
+    //             }
+    //             next_tx_num += 1;
+    //         }
+    //     }
+    //     debug!(target: "providers::db", senders_count = %senders_to_insert.len(), hash_numbers_count = %tx_lookup_to_insert.len(), block_count = %blocks.len(), duration = ?start_at.elapsed(), "Collected transaction metadata");
+
+    //     if should_insert_senders {
+    //         let count = senders_to_insert.len();
+    //         let start_at = Instant::now();
+    //         if count > 0 {
+    //             let mut cursor = self.tx.cursor_write::<tables::TransactionSenders>()?;
+    //             for (tx_num, sender) in senders_to_insert {
+    //                 cursor.append(tx_num, &sender)?;
+    //             }
+    //         }
+    //         durations_recorder.record_relative(metrics::Action::InsertTransactionSenders);
+    //         debug!(target: "providers::db", tx_count = %count, block_count = %blocks.len(), duration = ?start_at.elapsed(), "Inserted transaction senders");
+    //     }
+
+    //     if should_insert_tx_lookup {
+    //         let start_at = Instant::now();
+    //         tx_lookup_to_insert.sort_by_key(|(hash, _)| *hash);
+    //         debug!(target: "providers::db", tx_count = %tx_lookup_to_insert.len(), block_count = %blocks.len(), duration = ?start_at.elapsed(), "Sorted transaction hash numbers");
+
+    //         let count = tx_lookup_to_insert.len();
+    //         let start_at = Instant::now();
+    //         if count > 0 {
+    //             let mut cursor = self.tx.cursor_write::<tables::TransactionHashNumbers>()?;
+    //             for (hash, tx_num) in tx_lookup_to_insert {
+    //                 cursor.upsert(hash, &tx_num)?;
+    //             }
+    //         }
+    //         durations_recorder.record_relative(metrics::Action::InsertTransactionHashNumbers);
+    //         debug!(target: "providers::db", tx_count = %count, block_count = %blocks.len(), duration = ?start_at.elapsed(), "Inserted transaction hash numbers");
+    //     }
+
+    //     // TODO: Do performant / batched writes for each type of object
+    //     // instead of a loop over all blocks,
+    //     // meaning:
+    //     //  * blocks
+    //     //  * state
+    //     //  * hashed state
+    //     //  * trie updates (cannot naively extend, need helper)
+    //     //  * indices (already done basically)
+    //     // Insert the blocks
+    //     for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in
+    //         blocks
+    //     {
+    //         let block_number = recovered_block.number();
+    //         // 300ms
+    //         debug!(target: "providers::db", ?block_number, "start insert block");
+    //         // self.insert_block(Arc::unwrap_or_clone(recovered_block))?;
+    //         let block_number = block.number();
+    //         let start_at = Instant::now();
+    
+    //         self.static_file_provider
+    //             .get_writer(block_number, StaticFileSegment::Headers)?
+    //             .append_header(block.header(), &block.hash())?;
+    
+    //         debug!(
+    //             target: "providers::db",
+    //             ?block_number,
+    //             duration = ?start_at.elapsed(),
+    //             "insert static file header"
+    //         );
+    
+    //         let tx_count = block.body().transaction_count() as u64;
+    //         self.append_block_bodies(vec![(block_number, Some(block.into_body()))])?;
+    
+
+
+    //         // Write state and changesets to the database.
+    //         // Must be written after blocks because of the receipt lookup.
+    //         // 72ms
+    //         self.write_state(&execution_output, OriginalValuesKnown::No)?;
+    //         debug!(target: "providers::db", ?block_number, "write state done");
+
+    //         // insert hashes and intermediate merkle nodes
+    //         // 34ms
+    //         self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
+    //         debug!(target: "providers::db", ?block_number, "Inserted hashed state");
+
+    //         // sort trie updates and insert changesets
+    //         // 83ms
+    //         let trie_updates_sorted = (*trie_updates).clone().into_sorted();
+    //         self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
+    //         self.write_trie_updates_sorted(&trie_updates_sorted)?;
+    //         debug!(target: "providers::db", ?block_number, "inserted tries, insert block done");
+    //     }
+
+    //     durations_recorder.record_relative(metrics::Action::InsertBlock);
+
+    //     // update history indices
+    //     self.update_history_indices(first_number..=last_block_number)?;
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Updated history indices");
+
+    //     durations_recorder.record_relative(metrics::Action::UpdateHistoryIndices);
+
+    //     // Update pipeline progress
+    //     self.update_pipeline_stages(last_block_number, false)?;
+
+    //     debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
+
+    //     Ok(())
+    // }
 
     /// Unwinds trie state starting at and including the given block.
     ///
@@ -389,7 +1052,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
         // if the block number is the same as the currently best block number on disk we can use the
         // latest state provider here
         if block_number == self.best_block_number().unwrap_or_default() {
-            return Ok(Box::new(LatestStateProvider::new(self)))
+            return Ok(Box::new(LatestStateProvider::new(self)));
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
@@ -453,7 +1116,7 @@ where
     while let Some((sharded_key, list)) = item {
         // If the shard does not belong to the key, break.
         if !shard_belongs_to_key(&sharded_key) {
-            break
+            break;
         }
 
         // Always delete the current shard from the database first
@@ -468,18 +1131,18 @@ where
         // Keep it deleted (don't return anything for reinsertion)
         if first >= block_number {
             item = cursor.prev()?;
-            continue
+            continue;
         }
         // Case 2: This is a boundary shard (spans across the unwinding point)
         // The shard contains some blocks below and some at/above the unwinding point
         else if block_number <= sharded_key.as_ref().highest_block_number {
             // Return only the block numbers that are below the unwinding point
             // These will be reinserted to preserve the historical data
-            return Ok(list.iter().take_while(|i| *i < block_number).collect::<Vec<_>>())
+            return Ok(list.iter().take_while(|i| *i < block_number).collect::<Vec<_>>());
         }
         // Case 3: Entire shard is below the unwinding point
         // Return all block numbers for reinsertion (preserve entire shard)
-        return Ok(list.iter().collect::<Vec<_>>())
+        return Ok(list.iter().collect::<Vec<_>>());
     }
 
     // No shards found or all processed
@@ -582,7 +1245,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         F: FnMut(H, BodyTy<N>, Range<TxNumber>) -> ProviderResult<R>,
     {
         if range.is_empty() {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
 
         let len = range.end().saturating_sub(*range.start()) as usize;
@@ -771,7 +1434,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
             // delete old shard so new one can be inserted.
             cursor.delete_current()?;
             let list = list.iter().collect::<Vec<_>>();
-            return Ok(list)
+            return Ok(list);
         }
         Ok(Vec::new())
     }
@@ -943,7 +1606,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderSyncGapProvider
             }
             Ordering::Less => {
                 // There's either missing or corrupted files.
-                return Err(ProviderError::HeaderNotFound(next_static_file_block_num.into()))
+                return Err(ProviderError::HeaderNotFound(next_static_file_block_num.into()));
             }
             Ordering::Equal => {}
         }
@@ -1054,15 +1717,15 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
     /// If the header is found, but the transactions either do not exist, or are not indexed, this
     /// will return None.
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
-        if let Some(number) = self.convert_hash_or_number(id)? &&
-            let Some(header) = self.header_by_number(number)?
+        if let Some(number) = self.convert_hash_or_number(id)?
+            && let Some(header) = self.header_by_number(number)?
         {
             // If the body indices are not found, this means that the transactions either do not
             // exist in the database yet, or they do exit but are not indexed.
             // If they exist but are not indexed, we don't have enough
             // information to return the block anyways, so we return `None`.
             let Some(transactions) = self.transactions_by_block(number.into())? else {
-                return Ok(None)
+                return Ok(None);
             };
 
             let body = self
@@ -1072,7 +1735,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
                 .pop()
                 .ok_or(ProviderError::InvalidStorageOutput)?;
 
-            return Ok(Some(Self::Block::new(header, body)))
+            return Ok(Some(Self::Block::new(header, body)));
         }
 
         Ok(None)
@@ -1229,10 +1892,10 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         tx_hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
-        if let Some(transaction_id) = self.transaction_id(tx_hash)? &&
-            let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? &&
-            let Some(block_number) = self.block_by_transaction_id(transaction_id)? &&
-            let Some(sealed_header) = self.sealed_header(block_number)?
+        if let Some(transaction_id) = self.transaction_id(tx_hash)?
+            && let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)?
+            && let Some(block_number) = self.block_by_transaction_id(transaction_id)?
+            && let Some(sealed_header) = self.sealed_header(block_number)?
         {
             let (header, block_hash) = sealed_header.split();
             if let Some(block_body) = self.block_body_indices(block_number)? {
@@ -1252,7 +1915,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
                     timestamp: header.timestamp(),
                 };
 
-                return Ok(Some((transaction, meta)))
+                return Ok(Some((transaction, meta)));
             }
         }
 
@@ -1268,15 +1931,15 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
-        if let Some(block_number) = self.convert_hash_or_number(id)? &&
-            let Some(body) = self.block_body_indices(block_number)?
+        if let Some(block_number) = self.convert_hash_or_number(id)?
+            && let Some(body) = self.block_body_indices(block_number)?
         {
             let tx_range = body.tx_num_range();
             return if tx_range.is_empty() {
                 Ok(Some(Vec::new()))
             } else {
                 self.transactions_by_tx_range(tx_range).map(Some)
-            }
+            };
         }
         Ok(None)
     }
@@ -1343,15 +2006,15 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
         &self,
         block: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
-        if let Some(number) = self.convert_hash_or_number(block)? &&
-            let Some(body) = self.block_body_indices(number)?
+        if let Some(number) = self.convert_hash_or_number(block)?
+            && let Some(body) = self.block_body_indices(number)?
         {
             let tx_range = body.tx_num_range();
             return if tx_range.is_empty() {
                 Ok(Some(Vec::new()))
             } else {
                 self.receipts_by_tx_range(tx_range).map(Some)
-            }
+            };
         }
         Ok(None)
     }
@@ -1577,6 +2240,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         execution_outcome: &ExecutionOutcome<Self::Receipt>,
         is_value_known: OriginalValuesKnown,
     ) -> ProviderResult<()> {
+        let start = Instant::now();
         let first_block = execution_outcome.first_block();
         let block_count = execution_outcome.len() as u64;
         let last_block = execution_outcome.last_block();
@@ -1586,16 +2250,37 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
         let (plain_state, reverts) =
             execution_outcome.bundle.to_plain_state_and_reverts(is_value_known);
+        histogram!("storage.providers.database.block.write_state", 
+            vec![Label::new("operation", "to_plain_state_and_reverts")]).record(start.elapsed());
 
+        let reverts_start = Instant::now();
         self.write_state_reverts(reverts, first_block)?;
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "reverts")]
+        )
+        .record(reverts_start.elapsed());
+
+        let changes_start = Instant::now();
         self.write_state_changes(plain_state)?;
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "changes")]
+        )
+        .record(changes_start.elapsed());
 
         // Fetch the first transaction number for each block in the range
+        let block_indices_start = Instant::now();
         let block_indices: Vec<_> = self
             .block_body_indices_range(block_range)?
             .into_iter()
             .map(|b| b.first_tx_num)
             .collect();
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "block_indices")]
+        )
+        .record(block_indices_start.elapsed());
 
         // Ensure all expected blocks are present.
         if block_indices.len() < block_count as usize {
@@ -1626,6 +2311,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         let prunable_receipts =
             PruneMode::Distance(MINIMUM_PRUNING_DISTANCE).should_prune(first_block, tip);
 
+        let receipts_start = Instant::now();
         for (idx, (receipts, first_tx_index)) in
             execution_outcome.receipts.iter().zip(block_indices).enumerate()
         {
@@ -1655,6 +2341,17 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 }
             }
         }
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "receipts")]
+        )
+        .record(receipts_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.block.write_state",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(())
     }
@@ -1777,8 +2474,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
             for entry in storage {
                 tracing::trace!(?address, ?entry.key, "Updating plain state storage");
-                if let Some(db_entry) = storages_cursor.seek_by_key_subkey(address, entry.key)? &&
-                    db_entry.key == entry.key
+                if let Some(db_entry) = storages_cursor.seek_by_key_subkey(address, entry.key)?
+                    && db_entry.key == entry.key
                 {
                     storages_cursor.delete_current()?;
                 }
@@ -1793,7 +2490,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
     }
 
     fn write_hashed_state(&self, hashed_state: &HashedPostStateSorted) -> ProviderResult<()> {
+        let start = Instant::now();
+        
         // Write hashed account updates.
+        let accounts_start = Instant::now();
         let mut hashed_accounts_cursor = self.tx_ref().cursor_write::<tables::HashedAccounts>()?;
         for (hashed_address, account) in hashed_state.accounts().accounts_sorted() {
             if let Some(account) = account {
@@ -1802,8 +2502,14 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 hashed_accounts_cursor.delete_current()?;
             }
         }
+        histogram!(
+            "storage.providers.database.block.write_hashed_state",
+            vec![Label::new("operation", "accounts")]
+        )
+        .record(accounts_start.elapsed());
 
         // Write hashed storage changes.
+        let storage_start = Instant::now();
         let sorted_storages = hashed_state.account_storages().iter().sorted_by_key(|(key, _)| *key);
         let mut hashed_storage_cursor =
             self.tx_ref().cursor_dup_write::<tables::HashedStorages>()?;
@@ -1826,6 +2532,17 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 }
             }
         }
+        histogram!(
+            "storage.providers.database.block.write_hashed_state",
+            vec![Label::new("operation", "storage")]
+        )
+        .record(storage_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.block.write_hashed_state",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(())
     }
@@ -1948,7 +2665,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         let range = block + 1..=self.last_block_number()?;
 
         if range.is_empty() {
-            return Ok(ExecutionOutcome::default())
+            return Ok(ExecutionOutcome::default());
         }
         let start_block_number = *range.start();
 
@@ -2061,13 +2778,15 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
     }
 }
 
+
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider<TX, N> {
     /// Writes trie updates to the database with already sorted updates.
     ///
     /// Returns the number of entries modified.
     fn write_trie_updates_sorted(&self, trie_updates: &TrieUpdatesSorted) -> ProviderResult<usize> {
+        let start = Instant::now();
         if trie_updates.is_empty() {
-            return Ok(0)
+            return Ok(0);
         }
 
         // Track the number of inserted entries.
@@ -2077,6 +2796,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         let mut account_trie_cursor = tx.cursor_write::<tables::AccountsTrie>()?;
 
         // Process sorted account nodes
+        let account_updates_start = Instant::now();
         for (key, updated_node) in trie_updates.account_nodes_ref() {
             let nibbles = StoredNibbles(*key);
             match updated_node {
@@ -2094,9 +2814,26 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
                 }
             }
         }
+        histogram!(
+            "storage.providers.database.block.write_trie_updates_sorted",
+            vec![Label::new("operation", "account_updates")]
+        )
+        .record(account_updates_start.elapsed());
 
+        let storage_updates_start = Instant::now();
         num_entries +=
             self.write_storage_trie_updates_sorted(trie_updates.storage_tries_ref().iter())?;
+        histogram!(
+            "storage.providers.database.block.write_trie_updates_sorted",
+            vec![Label::new("operation", "storage_updates")]
+        )
+        .record(storage_updates_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.block.write_trie_updates_sorted",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(num_entries)
     }
@@ -2114,6 +2851,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         trie_updates: &TrieUpdatesSorted,
         updates_overlay: Option<&TrieUpdatesSorted>,
     ) -> ProviderResult<usize> {
+        let start = Instant::now();
         let mut num_entries = 0;
 
         let mut changeset_cursor =
@@ -2135,6 +2873,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         let mut in_memory_account_cursor =
             InMemoryTrieCursor::new(Some(&mut db_account_cursor), account_overlay_updates);
 
+        let account_changesets_start = Instant::now();
         for (path, _) in trie_updates.account_nodes_ref() {
             num_entries += 1;
             let node = in_memory_account_cursor.seek_exact(*path)?.map(|(_, node)| node);
@@ -2143,7 +2882,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
                 TrieChangeSetsEntry { nibbles: StoredNibblesSubKey(*path), node },
             )?;
         }
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "account_changesets")]
+        )
+        .record(account_changesets_start.elapsed());
 
+        let storage_changesets_start = Instant::now();
         let mut storage_updates = trie_updates.storage_tries_ref().iter().collect::<Vec<_>>();
         storage_updates.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
@@ -2152,6 +2897,17 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
             storage_updates.into_iter(),
             updates_overlay,
         )?;
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "storage_changesets")]
+        )
+        .record(storage_changesets_start.elapsed());
+
+        histogram!(
+            "storage.providers.database.block.write_trie_changesets",
+            vec![Label::new("operation", "total")]
+        )
+        .record(start.elapsed());
 
         Ok(num_entries)
     }
@@ -2657,8 +3413,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
                 StorageShardedKey::last(address, storage_key),
                 rem_index,
                 |storage_sharded_key| {
-                    storage_sharded_key.address == address &&
-                        storage_sharded_key.sharded_key.key == storage_key
+                    storage_sharded_key.address == address
+                        && storage_sharded_key.sharded_key.key == storage_key
                 },
             )?;
 
@@ -2701,17 +3457,25 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
     }
 
     fn update_history_indices(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        // account history stage
-        {
-            let indices = self.changed_accounts_and_blocks_with_range(range.clone())?;
-            self.insert_account_history_index(indices)?;
-        }
+        let start = Instant::now();
+        // account history stage - step 1: changed accounts and blocks
+        let indices = self.changed_accounts_and_blocks_with_range(range.clone())?;
+        histogram!("storage.providers.database.update_history_indices", vec![Label::new("operation", "changed_accounts_and_blocks")]).record(start.elapsed());
 
-        // storage history stage
-        {
-            let indices = self.changed_storages_and_blocks_with_range(range)?;
-            self.insert_storage_history_index(indices)?;
-        }
+        // account history stage - step 2: insert account history index
+        let insert_account_history_index_start = Instant::now();
+        self.insert_account_history_index(indices)?;
+        histogram!("storage.providers.database.update_history_indices", vec![Label::new("operation", "insert_account_history_index")]).record(insert_account_history_index_start.elapsed());
+
+        // storage history stage - step 3: changed storages and blocks
+        let changed_storages_and_blocks_start = Instant::now();
+        let indices = self.changed_storages_and_blocks_with_range(range)?;
+        histogram!("storage.providers.database.update_history_indices", vec![Label::new("operation", "changed_storages_and_blocks")]).record(changed_storages_and_blocks_start.elapsed());
+
+        // storage history stage - step 4: insert storage history index
+        let insert_storage_history_index_start = Instant::now();
+        self.insert_storage_history_index(indices)?;
+        histogram!("storage.providers.database.update_history_indices", vec![Label::new("operation", "insert_storage_history_index")]).record(insert_storage_history_index_start.elapsed());
 
         Ok(())
     }
@@ -2812,18 +3576,54 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
         let tx_count = block.body().transaction_count() as u64;
 
-        // Ensures we have all the senders for the block's transactions.
+        // Collect transaction senders and hash numbers for batch insertion
+        let should_insert_senders =
+            self.prune_modes.sender_recovery.as_ref().is_none_or(|m| !m.is_full());
+        let should_insert_tx_lookup =
+            self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full());
+
+        let mut senders_to_insert = Vec::new();
+        let mut tx_lookup_to_insert = Vec::new();
+
         for (transaction, sender) in block.body().transactions_iter().zip(block.senders_iter()) {
             let hash = transaction.tx_hash();
 
-            if self.prune_modes.sender_recovery.as_ref().is_none_or(|m| !m.is_full()) {
-                self.tx.put::<tables::TransactionSenders>(next_tx_num, *sender)?;
+            if should_insert_senders {
+                senders_to_insert.push((next_tx_num, *sender));
             }
 
-            if self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full()) {
-                self.tx.put::<tables::TransactionHashNumbers>(*hash, next_tx_num)?;
+            if should_insert_tx_lookup {
+                tx_lookup_to_insert.push((*hash, next_tx_num));
             }
             next_tx_num += 1;
+        }
+
+        // Insert transaction senders using cursor (already sorted by tx_num)
+        if should_insert_senders && !senders_to_insert.is_empty() {
+            let count = senders_to_insert.len();
+            let start_at = Instant::now();
+            let mut cursor = self.tx.cursor_write::<tables::TransactionSenders>()?;
+            for (tx_num, sender) in senders_to_insert {
+                cursor.append(tx_num, &sender)?;
+            }
+            durations_recorder.record_relative(metrics::Action::InsertTransactionSenders);
+            debug!(target: "providers::db", ?block_number, tx_count = %count, duration = ?start_at.elapsed(), "Inserted transaction senders");
+        }
+
+        // Insert transaction hash numbers using cursor (sort first for better performance)
+        if should_insert_tx_lookup && !tx_lookup_to_insert.is_empty() {
+            let count = tx_lookup_to_insert.len();
+            let start_at = Instant::now();
+            tx_lookup_to_insert.sort_by_key(|(hash, _)| *hash);
+            let sort_duration = start_at.elapsed();
+
+            let insert_start = Instant::now();
+            let mut cursor = self.tx.cursor_write::<tables::TransactionHashNumbers>()?;
+            for (hash, tx_num) in tx_lookup_to_insert {
+                cursor.upsert(hash, &tx_num)?;
+            }
+            durations_recorder.record_relative(metrics::Action::InsertTransactionHashNumbers);
+            debug!(target: "providers::db", ?block_number, tx_count = %count, sort_duration = ?sort_duration, insert_duration = ?insert_start.elapsed(), "Inserted transaction hash numbers");
         }
 
         self.append_block_bodies(vec![(block_number, Some(block.into_body()))])?;
@@ -2837,6 +3637,36 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
         Ok(StoredBlockBodyIndices { first_tx_num, tx_count })
     }
+
+    // fn insert_block(
+    //     &self,
+    //     block: RecoveredBlock<Self::Block>,
+    // ) -> ProviderResult<StoredBlockBodyIndices> {
+    //     let block_number = block.number();
+    //     let start_at = Instant::now();
+
+    //     self.static_file_provider
+    //         .get_writer(block_number, StaticFileSegment::Headers)?
+    //         .append_header(block.header(), &block.hash())?;
+
+    //     debug!(
+    //         target: "providers::db",
+    //         ?block_number,
+    //         duration = ?start_at.elapsed(),
+    //         "insert static file header"
+    //     );
+
+    //     let tx_count = block.body().transaction_count() as u64;
+    //     self.append_block_bodies(vec![(block_number, Some(block.into_body()))])?;
+
+    //     debug!(
+    //         target: "providers::db",
+    //         ?block_number,
+    //         "Inserted block"
+    //     );
+
+    //     Ok(StoredBlockBodyIndices { first_tx_num: 1, tx_count })
+    // }
 
     fn append_block_bodies(
         &self,
@@ -2976,7 +3806,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
     ) -> ProviderResult<()> {
         if blocks.is_empty() {
             debug!(target: "providers::db", "Attempted to append empty block range");
-            return Ok(())
+            return Ok(());
         }
 
         // Blocks are not empty, so no need to handle the case of `blocks.first()` being
@@ -3126,8 +3956,15 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
             self.tx.commit()?;
             self.static_file_provider.commit()?;
         } else {
-            self.static_file_provider.commit()?;
+            let start_tx_commit = Instant::now();
             self.tx.commit()?;
+            let tx_commit_duration = start_tx_commit.elapsed();
+
+            let start_static_file_commit = Instant::now();
+            self.static_file_provider.commit()?;
+            let static_file_commit_duration = start_static_file_commit.elapsed();
+
+            tracing::debug!(target: "db::provider", ?tx_commit_duration, ?static_file_commit_duration,"Committed static files and database transaction");
         }
 
         Ok(true)

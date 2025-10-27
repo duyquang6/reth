@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
-const LARGE_VALUE_THRESHOLD_BYTES: usize = 4096;
+const LARGE_VALUE_THRESHOLD_BYTES: usize = 0;
 
 /// Caches metric handles for database environment to make sure handles are not re-created
 /// on every operation.
@@ -351,15 +351,20 @@ impl OperationMetrics {
     pub(crate) fn record<R>(&self, value_size: Option<usize>, f: impl FnOnce() -> R) -> R {
         self.calls_total.increment(1);
 
-        // Record duration only for large values to prevent the performance hit of clock syscall
-        // on small operations
-        if value_size.is_some_and(|size| size > LARGE_VALUE_THRESHOLD_BYTES) {
-            let start = Instant::now();
-            let result = f();
-            self.large_value_duration_seconds.record(start.elapsed());
-            result
-        } else {
-            f()
-        }
+        // // Record duration only for large values to prevent the performance hit of clock syscall
+        // // on small operations
+        // if value_size.is_some_and(|size| size > LARGE_VALUE_THRESHOLD_BYTES) {
+        //     let start = Instant::now();
+        //     let result = f();
+        //     self.large_value_duration_seconds.record(start.elapsed());
+        //     result
+        // } else {
+        //     f()
+        // }
+
+        let start = Instant::now();
+        let result = f();
+        self.large_value_duration_seconds.record(start.elapsed());
+        result
     }
 }
