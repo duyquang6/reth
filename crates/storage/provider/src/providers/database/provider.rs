@@ -287,21 +287,28 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         } in blocks
         {
             let block_hash = recovered_block.hash();
+            debug!(target: "providers::db", ?block_hash, "start insert block");
+
             self.insert_block(Arc::unwrap_or_clone(recovered_block))?;
+            debug!(target: "providers::db", ?block_hash, "inserted block");
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
             self.write_state(&execution_output, OriginalValuesKnown::No)?;
+            debug!(target: "providers::db", ?block_hash, "write state done");
 
             // insert hashes and intermediate merkle nodes
             self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
+            debug!(target: "providers::db", ?block_hash, "Inserted hashed state");
             self.write_trie_updates(
                 trie.as_ref().ok_or(ProviderError::MissingTrieUpdates(block_hash))?,
             )?;
+            debug!(target: "providers::db", ?block_hash, "inserted trie updates, insert block done");
         }
 
         // update history indices
         self.update_history_indices(first_number..=last_block_number)?;
+        debug!(target: "providers::db", range = ?first_number..=last_block_number, "Updated history indices");
 
         // Update pipeline progress
         self.update_pipeline_stages(last_block_number, false)?;

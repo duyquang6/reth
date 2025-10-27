@@ -152,10 +152,14 @@ impl<T: PayloadTypes> PayloadBuilderHandle<T> {
         id: PayloadId,
         kind: PayloadKind,
     ) -> Option<Result<T::BuiltPayload, PayloadBuilderError>> {
+        debug!(target: "payload_builder", %id, "resolving payload job");
         let (tx, rx) = oneshot::channel();
         self.to_service.send(PayloadServiceCommand::Resolve(id, kind, tx)).ok()?;
         match rx.await.transpose()? {
-            Ok(fut) => Some(fut.await),
+            Ok(fut) => {
+                debug!(target: "payload_builder", %id, "payload job resolved");
+                Some(fut.await)
+            }
             Err(e) => Some(Err(e.into())),
         }
     }
@@ -305,8 +309,8 @@ where
     ) -> Option<PayloadFuture<T::BuiltPayload>> {
         debug!(target: "payload_builder", %id, "resolving payload job");
 
-        if let Some((cached, _, payload)) = &*self.cached_payload_rx.borrow() &&
-            *cached == id
+        if let Some((cached, _, payload)) = &*self.cached_payload_rx.borrow()
+            && *cached == id
         {
             return Some(Box::pin(core::future::ready(Ok(payload.clone()))));
         }
@@ -356,8 +360,8 @@ where
 {
     /// Returns the payload timestamp for the given payload.
     fn payload_timestamp(&self, id: PayloadId) -> Option<Result<u64, PayloadBuilderError>> {
-        if let Some((cached_id, timestamp, _)) = *self.cached_payload_rx.borrow() &&
-            cached_id == id
+        if let Some((cached_id, timestamp, _)) = *self.cached_payload_rx.borrow()
+            && cached_id == id
         {
             return Some(Ok(timestamp));
         }
@@ -472,7 +476,7 @@ where
             }
 
             if !new_job {
-                return Poll::Pending
+                return Poll::Pending;
             }
         }
     }
