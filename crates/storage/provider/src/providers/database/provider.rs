@@ -307,6 +307,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
 
         let mut aggregated_hashed_state = HashedPostState::default();
+        let mut aggregated_trie_updates_sorted = TrieUpdatesSorted::default();
 
         // TODO: Do performant / batched writes for each type of object
         // instead of a loop over all blocks,
@@ -314,7 +315,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         //  * blocks
         //  * state
         //  * hashed state (already done)
-        //  * trie updates (cannot naively extend, need helper)
+        //  * trie updates sorted (already done)
         //  * indices (already done basically)
         // Insert the blocks
         for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in
@@ -332,13 +333,16 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             // sort trie updates and insert changesets
             let trie_updates_sorted = (*trie_updates).clone().into_sorted();
             self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
-            self.write_trie_updates_sorted(&trie_updates_sorted)?;
+            aggregated_trie_updates_sorted.extend_ref(&trie_updates_sorted);
         }
 
         // batch insert hashes
         if !aggregated_hashed_state.is_empty() {
             self.write_hashed_state(&aggregated_hashed_state.into_sorted())?;
         }
+
+        // batch write trie updates sorted
+        self.write_trie_updates_sorted(&aggregated_trie_updates_sorted)?;
 
         // update history indices
         self.update_history_indices(first_number..=last_block_number)?;
@@ -4827,5 +4831,182 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_aggregation_bug_causes_wrong_state_after_unwind() {
+        // This test reproduces the bug where aggregating trie updates causes incorrect changesets
+        // to be written, which then causes wrong state after unwinding.
+        //
+        // The REAL bug flow (as in the bad code):
+        // 1. Block 1: write_trie_changesets(), aggregate updates (DON'T write to DB yet)
+        // 2. Block 2: write_trie_changesets() - but block 1's updates aren't in DB!
+        //             → Records WRONG "old values" in changesets (sees genesis, not block 1)
+        //    aggregate updates
+        // 3. Write ALL aggregated updates at once
+        // 4. Later: unwind to block 1 using bad changesets → WRONG STATE!
+
+        use reth_trie::{
+            updates::TrieUpdates, BranchNodeCompact, Nibbles, StoredNibbles, TrieMask,
+        };
+
+        let factory = create_test_provider_factory();
+
+        // Setup: Create initial state at genesis (block 0)
+        let nibbles = Nibbles::from_nibbles([0x1, 0x2, 0x3]);
+        let node_genesis = BranchNodeCompact::new(
+            0b1010_0000_0000_0000, // Genesis state mask
+            0b0000_0000_0000_0000,
+            0b0000_0000_0000_0000,
+            vec![],
+            None,
+        );
+
+        {
+            let provider_rw = factory.provider_rw().unwrap();
+            let mut genesis_updates = TrieUpdates::default();
+            genesis_updates.account_nodes.insert(nibbles, node_genesis.clone());
+            let genesis_updates_sorted = genesis_updates.into_sorted();
+            provider_rw.write_trie_updates_sorted(&genesis_updates_sorted).unwrap();
+            provider_rw.commit().unwrap();
+        };
+
+        // Now simulate the BAD aggregation code: Process blocks 1 and 2 with aggregation
+        let node_v1 = BranchNodeCompact::new(
+            0b1111_0000_0000_0000, // Block 1 state mask
+            0b0000_0000_0000_0000,
+            0b0000_0000_0000_0000,
+            vec![],
+            None,
+        );
+
+        let node_v2 = BranchNodeCompact::new(
+            0b0000_1111_0000_0000, // Block 2 state mask
+            0b0000_0000_0000_0000,
+            0b0000_0000_0000_0000,
+            vec![],
+            None,
+        );
+
+        {
+            let provider_rw = factory.provider_rw().unwrap();
+            
+            // Aggregate trie updates (mimic line 336 in bad code)
+            let mut aggregated_trie_updates = TrieUpdates::default();
+
+            // === Process Block 1 ===
+            let mut updates_1 = TrieUpdates::default();
+            updates_1.account_nodes.insert(nibbles, node_v1.clone());
+            
+            // Aggregate first (DON'T write to DB yet - this is the bug!)
+            aggregated_trie_updates.extend(updates_1.clone());
+            
+            // BAD: Write changesets for block 1 (this is OK, sees genesis in DB)
+            let updates_1_sorted = updates_1.into_sorted();
+            provider_rw.write_trie_changesets(1, &updates_1_sorted, None).unwrap();
+
+            // === Process Block 2 ===
+            let mut updates_2 = TrieUpdates::default();
+            updates_2.account_nodes.insert(nibbles, node_v2.clone());
+            
+            // Aggregate
+            aggregated_trie_updates.extend(updates_2.clone());
+            
+            // BAD: Write changesets for block 2
+            // Block 1's node_v1 is NOT in DB yet (still in aggregated_trie_updates)!
+            // So this will record the WRONG old value (genesis instead of node_v1)
+            let updates_2_sorted = updates_2.into_sorted();
+            provider_rw.write_trie_changesets(2, &updates_2_sorted, None).unwrap();
+
+            // === Write ALL aggregated updates at once (line 345 in bad code) ===
+            let aggregated_sorted = aggregated_trie_updates.into_sorted();
+            provider_rw.write_trie_updates_sorted(&aggregated_sorted).unwrap();
+            
+            provider_rw.commit().unwrap();
+        };
+
+        // Verify the bug: Check what changeset was recorded for block 2
+        println!("\n=== VERIFICATION: Checking Block 2 Changesets ===");
+        {
+            let provider = factory.provider().unwrap();
+            
+            let mut cursor = provider.tx_ref()
+                .cursor_dup_read::<tables::AccountsTrieChangeSets>()
+                .unwrap();
+
+            // Read block 2 changesets
+            let block_2_changesets: Vec<_> = cursor
+                .walk_dup(Some(2), None)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            let changeset_entry = block_2_changesets
+                .iter()
+                .find(|(_, entry)| entry.nibbles.0 == nibbles);
+
+            if let Some((_, entry)) = changeset_entry {
+                println!("Block 2 changeset recorded old value: {:?}", entry.node);
+                println!("Expected (node_v1): state_mask = 0b1111_0000_0000_0000");
+                println!("But might have (node_genesis): state_mask = 0b1010_0000_0000_0000");
+                
+                // Check if it recorded the wrong value
+                if let Some(recorded_node) = &entry.node {
+                    if recorded_node.state_mask == node_genesis.state_mask {
+                        println!("⚠️  BUG DETECTED: Changeset recorded genesis node instead of node_v1!");
+                    } else if recorded_node.state_mask == node_v1.state_mask {
+                        println!("✅ Changeset is correct (recorded node_v1)");
+                    }
+                }
+            } else {
+                panic!("No changeset found for block 2");
+            }
+        }
+
+        // Test the impact: Unwind to block 1 and check state corruption
+        println!("\n=== IMPACT TEST: Unwinding to Block 1 ===");
+        {
+            let provider_rw = factory.provider_rw().unwrap();
+            
+            // Unwind to block 1 (will use the potentially-bad changesets from block 2)
+            provider_rw.unwind_trie_state_from(2).unwrap();
+            provider_rw.commit().unwrap();
+            
+            // Check if the trie state is correct at block 1
+            let provider = factory.provider().unwrap();
+            use reth_db_api::cursor::DbCursorRO;
+            
+            let mut cursor = provider.tx_ref()
+                .cursor_read::<tables::AccountsTrie>()
+                .unwrap();
+            
+            let current_node = cursor.seek_exact(StoredNibbles(nibbles)).unwrap();
+            
+            if let Some((_, node)) = current_node {
+                println!("After unwind, trie state_mask: {:?}", node.state_mask);
+                println!("Expected (node_v1): {:?}", node_v1.state_mask);
+                
+                let expected_mask = TrieMask::new(0b1111_0000_0000_0000u16);
+                if node.state_mask != expected_mask {
+                    panic!(
+                        "\n❌ BUG REPRODUCED!\n\
+                         After unwinding to block 1, trie state is INCORRECT.\n\
+                         Expected state_mask: {:?}\n\
+                         Got state_mask: {:?}\n\
+                         \n\
+                         This proves the aggregation bug:\n\
+                         - Block 2's changeset recorded the wrong old value (genesis instead of node_v1)\n\
+                         - Unwinding used that bad changeset\n\
+                         - State at block 1 is now corrupted!\n\
+                         - This would cause state root mismatches when rebuilding blocks.\n",
+                        expected_mask, node.state_mask
+                    );
+                } else {
+                    println!("✅ State is correct after unwind");
+                }
+            }
+        }
+
+        println!("\n✅ Test completed successfully");
     }
 }
