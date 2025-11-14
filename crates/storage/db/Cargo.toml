@@ -63,6 +63,10 @@ proptest.workspace = true
 
 assert_matches.workspace = true
 
+# For benchmarking alternative backends
+rocksdb = "0.24"
+rand.workspace = true
+
 [features]
 default = ["mdbx"]
 mdbx = [
@@ -115,5 +119,10 @@ harness = false
 
 [[bench]]
 name = "put"
+required-features = ["test-utils"]
+harness = false
+
+[[bench]]
+name = "tx_hash_number"
 required-features = ["test-utils"]
 harness = false
