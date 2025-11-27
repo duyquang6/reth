@@ -30,9 +30,10 @@ use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{
     keccak256,
     map::{hash_map, B256Map, HashMap, HashSet},
-    Address, BlockHash, BlockNumber, TxHash, TxNumber, B256,
+    Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256,
 };
 use itertools::Itertools;
+use ::metrics::histogram;
 use parking_lot::RwLock;
 use rayon::slice::ParallelSliceMut;
 use reth_chain_state::ExecutedBlock;
@@ -71,7 +72,7 @@ use reth_trie::{
         TrieCursorIter,
     },
     updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
-    HashedPostStateSorted, StoredNibbles, StoredNibblesSubKey, TrieChangeSetsEntry,
+    HashedPostStateSorted, HashedStorageSorted, StoredNibbles, StoredNibblesSubKey, TrieChangeSetsEntry,
 };
 use reth_trie_db::{
     DatabaseAccountTrieCursor, DatabaseStorageTrieCursor, DatabaseTrieCursorFactory,
@@ -83,8 +84,9 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
+    fs,
     ops::{Deref, DerefMut, Range, RangeBounds, RangeFrom, RangeInclusive},
-    sync::Arc,
+    sync::Arc, time::{Duration, Instant},
 };
 use tracing::{debug, trace};
 
@@ -302,6 +304,38 @@ impl<TX, N: NodeTypes> AsRef<Self> for DatabaseProvider<TX, N> {
 }
 
 impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
+    /// Serializes HashedPostStateSorted to binary format for debugging.
+    fn serialize_hashed_post_state_sorted(
+        state: &HashedPostStateSorted,
+    ) -> Result<Vec<u8>, String> {
+        use bincode::serialize;
+        
+        // Serialize accounts: Vec<(B256, Option<Account>)>
+        let accounts_data = serialize(state.accounts())
+            .map_err(|e| format!("Failed to serialize accounts: {}", e))?;
+        
+        // Serialize storages: B256Map<HashedStorageSorted>
+        // Convert to Vec for serialization
+        let storages_vec: Vec<(B256, (Vec<(B256, U256)>, bool))> = state
+            .account_storages()
+            .iter()
+            .map(|(addr, storage)| {
+                (*addr, (storage.storage_slots_ref().to_vec(), storage.is_wiped()))
+            })
+            .collect();
+        let storages_data = serialize(&storages_vec)
+            .map_err(|e| format!("Failed to serialize storages: {}", e))?;
+        
+        // Combine: accounts_len (u64) + accounts_data + storages_len (u64) + storages_data
+        let mut result = Vec::new();
+        result.extend_from_slice(&(accounts_data.len() as u64).to_le_bytes());
+        result.extend_from_slice(&accounts_data);
+        result.extend_from_slice(&(storages_data.len() as u64).to_le_bytes());
+        result.extend_from_slice(&storages_data);
+        
+        Ok(result)
+    }
+
     /// Writes executed blocks and state to storage.
     pub fn save_blocks(&self, blocks: Vec<ExecutedBlock<N::Primitives>>) -> ProviderResult<()> {
         if blocks.is_empty() {
@@ -319,6 +353,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
 
         let mut aggregated_hashed_post_state_sorted = HashedPostStateSorted::default();
+        let mut duration = Duration::from_secs(0);
 
         // TODO: Do performant / batched writes for each type of object
         // instead of a loop over all blocks,
@@ -341,13 +376,43 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
             // aggregate hashed post states for batch insert
             aggregated_hashed_post_state_sorted.extend_ref(&trie_data.hashed_state);
+            let start = Instant::now();
+            if aggregated_hashed_post_state_sorted.is_empty() {
+                aggregated_hashed_post_state_sorted = (*hashed_state).clone();
+            } else {
+                // Dump both states to binary files for debugging/reproduction
+                if let Err(e) = Self::serialize_hashed_post_state_sorted(&aggregated_hashed_post_state_sorted)
+                    .and_then(|data| {
+                        fs::write("/tmp/aggregated_hashed_post_state_sorted.bin", data)
+                            .map_err(|e| format!("Failed to write aggregated state: {}", e))
+                    }) {
+                    eprintln!("Failed to dump aggregated_hashed_post_state_sorted: {}", e);
+                }
+                if let Err(e) = Self::serialize_hashed_post_state_sorted(hashed_state.as_ref())
+                    .and_then(|data| {
+                        fs::write("/tmp/hashed_state.bin", data)
+                            .map_err(|e| format!("Failed to write hashed state: {}", e))
+                    }) {
+                    eprintln!("Failed to dump hashed_state: {}", e);
+                }
+                
+                aggregated_hashed_post_state_sorted.extend_ref(&hashed_state);
+            }
+
+            debug!(target: "providers::db", agg_len = %aggregated_hashed_post_state_sorted.accounts().len(), hashed_len = %hashed_state.accounts().len(), "Aggregated hashed post");
+
+            duration += start.elapsed();
 
             self.write_trie_changesets(block_number, &trie_data.trie_updates, None)?;
             self.write_trie_updates_sorted(&trie_data.trie_updates)?;
         }
 
         // batch insert hash post states
+        let start = Instant::now();
         self.write_hashed_state(&aggregated_hashed_post_state_sorted)?;
+        duration += start.elapsed();
+
+        histogram!("reth.storage.provider.database.save_blocks", "operation" => "write_hashed_state").record(duration);
 
         // update history indices
         self.update_history_indices(first_number..=last_block_number)?;

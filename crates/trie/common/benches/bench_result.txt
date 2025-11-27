@@ -1,0 +1,472 @@
+➜  reth git:(7144ef80f) ✗ cargo bench --bench extend_sorted_vec -p reth-trie-common
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.62s
+     Running benches/extend_sorted_vec.rs (target/release/deps/extend_sorted_vec-153f82fff7f84637)
+Gnuplot not found, using plotters backend
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t10_o10: Collecting 100 samples in estimated 5.0012 s (12
+extend_sorted_vec_comparison/extend_sorted_vec/t10_o10
+                        time:   [126.93 ns 127.79 ns 128.67 ns]
+                        change: [+33.746% +38.824% +43.331%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 19 outliers among 100 measurements (19.00%)
+  19 (19.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t10_o10: Collecting 100 samples in estimated 5.000
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t10_o10
+                        time:   [136.63 ns 137.37 ns 138.14 ns]
+                        change: [+44.179% +47.599% +50.998%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 18 outliers among 100 measurements (18.00%)
+  18 (18.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t10_o10: Collecting 100 samples in estimated 5.0007 s
+extend_sorted_vec_comparison/extend_sorted_vec_new/t10_o10
+                        time:   [107.55 ns 109.24 ns 110.77 ns]
+                        change: [+34.491% +39.333% +43.905%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t10_o100: Collecting 100 samples in estimated 5.0022 s (6
+extend_sorted_vec_comparison/extend_sorted_vec/t10_o100
+                        time:   [259.18 ns 262.62 ns 265.58 ns]
+                        change: [-13.122% -8.5888% -3.7537%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  9 (9.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t10_o100: Collecting 100 samples in estimated 5.00
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t10_o100
+                        time:   [266.82 ns 270.77 ns 274.07 ns]
+                        change: [-11.596% -6.8964% -1.5713%] (p = 0.01 < 0.05)
+                        Performance has improved.
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t10_o100: Collecting 100 samples in estimated 5.0017 
+extend_sorted_vec_comparison/extend_sorted_vec_new/t10_o100
+                        time:   [311.89 ns 315.04 ns 318.81 ns]
+                        change: [-13.891% -10.787% -7.4605%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+  10 (10.00%) low mild
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t10_o1000: Collecting 100 samples in estimated 5.0076 s (
+extend_sorted_vec_comparison/extend_sorted_vec/t10_o1000
+                        time:   [1.5070 µs 1.5197 µs 1.5327 µs]
+                        change: [-6.6891% -2.1068% +2.9635%] (p = 0.40 > 0.05)
+                        No change in performance detected.
+Found 16 outliers among 100 measurements (16.00%)
+  11 (11.00%) low severe
+  5 (5.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t10_o1000: Collecting 100 samples in estimated 5.0
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t10_o1000
+                        time:   [1.4822 µs 1.4988 µs 1.5138 µs]
+                        change: [-18.486% -12.682% -6.6705%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 10 outliers among 100 measurements (10.00%)
+  2 (2.00%) low severe
+  8 (8.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t10_o1000: Collecting 100 samples in estimated 5.0136
+extend_sorted_vec_comparison/extend_sorted_vec_new/t10_o1000
+                        time:   [2.5265 µs 2.5691 µs 2.6176 µs]
+                        change: [-8.2949% -5.8982% -3.4130%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 18 outliers among 100 measurements (18.00%)
+  10 (10.00%) low severe
+  3 (3.00%) low mild
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t10_o5000: Collecting 100 samples in estimated 5.0934 s (
+extend_sorted_vec_comparison/extend_sorted_vec/t10_o5000
+                        time:   [8.4586 µs 8.5363 µs 8.6204 µs]
+                        change: [-9.4349% -6.3637% -2.8583%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) low severe
+  4 (4.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t10_o5000: Collecting 100 samples in estimated 5.0
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t10_o5000
+                        time:   [6.9147 µs 7.0809 µs 7.2303 µs]
+                        change: [-13.927% -10.428% -6.8066%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t10_o5000: Collecting 100 samples in estimated 5.0606
+extend_sorted_vec_comparison/extend_sorted_vec_new/t10_o5000
+                        time:   [12.587 µs 12.675 µs 12.785 µs]
+                        change: [-5.7342% -2.3135% +1.4772%] (p = 0.22 > 0.05)
+                        No change in performance detected.
+Found 14 outliers among 100 measurements (14.00%)
+  1 (1.00%) low severe
+  8 (8.00%) low mild
+  1 (1.00%) high mild
+  4 (4.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t100_o10: Collecting 100 samples in estimated 5.0011 s (9
+extend_sorted_vec_comparison/extend_sorted_vec/t100_o10
+                        time:   [111.73 ns 112.11 ns 112.71 ns]
+                        change: [-0.9003% -0.5260% -0.0717%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) high mild
+  7 (7.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t100_o10: Collecting 100 samples in estimated 5.00
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t100_o10
+                        time:   [147.34 ns 151.34 ns 156.06 ns]
+                        change: [-2.0695% +0.4027% +2.8352%] (p = 0.75 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) high mild
+  3 (3.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t100_o10: Collecting 100 samples in estimated 5.0013 
+extend_sorted_vec_comparison/extend_sorted_vec_new/t100_o10
+                        time:   [204.46 ns 208.72 ns 213.41 ns]
+                        change: [+0.6307% +2.1938% +3.9336%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t100_o100: Collecting 100 samples in estimated 5.0057 s (
+extend_sorted_vec_comparison/extend_sorted_vec/t100_o100
+                        time:   [504.37 ns 510.57 ns 515.84 ns]
+                        change: [-18.879% -15.289% -11.413%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+  11 (11.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t100_o100: Collecting 100 samples in estimated 5.0
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t100_o100
+                        time:   [623.12 ns 630.23 ns 636.09 ns]
+                        change: [-9.2292% -5.9380% -2.4344%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  9 (9.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t100_o100: Collecting 100 samples in estimated 5.0065
+extend_sorted_vec_comparison/extend_sorted_vec_new/t100_o100
+                        time:   [568.88 ns 578.03 ns 585.97 ns]
+                        change: [-12.039% -7.8712% -3.1738%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+  11 (11.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t100_o1000: Collecting 100 samples in estimated 5.0007 s 
+extend_sorted_vec_comparison/extend_sorted_vec/t100_o1000
+                        time:   [1.5910 µs 1.6040 µs 1.6163 µs]
+                        change: [-9.9777% -6.0931% -1.5649%] (p = 0.01 < 0.05)
+                        Performance has improved.
+Found 12 outliers among 100 measurements (12.00%)
+  11 (11.00%) low severe
+  1 (1.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t100_o1000: Collecting 100 samples in estimated 5.
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t100_o1000
+                        time:   [1.9289 µs 1.9848 µs 2.0515 µs]
+                        change: [-11.219% -5.3561% +0.7712%] (p = 0.10 > 0.05)
+                        No change in performance detected.
+Found 12 outliers among 100 measurements (12.00%)
+  11 (11.00%) low mild
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t100_o1000: Collecting 100 samples in estimated 5.033
+extend_sorted_vec_comparison/extend_sorted_vec_new/t100_o1000
+                        time:   [3.2380 µs 3.2772 µs 3.3121 µs]
+                        change: [-9.8631% -6.3874% -2.4227%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+  11 (11.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t100_o5000: Collecting 100 samples in estimated 5.0897 s 
+extend_sorted_vec_comparison/extend_sorted_vec/t100_o5000
+                        time:   [8.8096 µs 8.8833 µs 8.9550 µs]
+                        change: [-12.373% -10.010% -7.4366%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) low severe
+  8 (8.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t100_o5000: Collecting 100 samples in estimated 5.
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t100_o5000
+                        time:   [7.4230 µs 7.5341 µs 7.6565 µs]
+                        change: [-10.313% -6.5850% -2.3138%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 16 outliers among 100 measurements (16.00%)
+  5 (5.00%) low severe
+  8 (8.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t100_o5000: Collecting 100 samples in estimated 5.053
+extend_sorted_vec_comparison/extend_sorted_vec_new/t100_o5000
+                        time:   [12.740 µs 12.832 µs 12.932 µs]
+                        change: [-8.7549% -7.2780% -5.7527%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t1000_o10: Collecting 100 samples in estimated 5.0087 s (
+extend_sorted_vec_comparison/extend_sorted_vec/t1000_o10
+                        time:   [1.0575 µs 1.0611 µs 1.0643 µs]
+                        change: [-3.2283% -2.4823% -1.7043%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t1000_o10: Collecting 100 samples in estimated 5.0
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t1000_o10
+                        time:   [807.52 ns 835.24 ns 864.30 ns]
+                        change: [+5.6532% +8.5086% +11.475%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t1000_o10: Collecting 100 samples in estimated 5.0015
+extend_sorted_vec_comparison/extend_sorted_vec_new/t1000_o10
+                        time:   [1.6747 µs 1.6830 µs 1.6940 µs]
+                        change: [-0.7530% +0.2879% +1.4376%] (p = 0.61 > 0.05)
+                        No change in performance detected.
+Found 17 outliers among 100 measurements (17.00%)
+  1 (1.00%) high mild
+  16 (16.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t1000_o100: Collecting 100 samples in estimated 5.0172 s 
+extend_sorted_vec_comparison/extend_sorted_vec/t1000_o100
+                        time:   [1.0922 µs 1.0995 µs 1.1067 µs]
+                        change: [-3.3215% -1.5804% -0.3131%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t1000_o100: Collecting 100 samples in estimated 5.
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t1000_o100
+                        time:   [2.1915 µs 2.2231 µs 2.2510 µs]
+                        change: [-10.026% -5.2577% +0.1469%] (p = 0.05 < 0.05)
+                        Change within noise threshold.
+Found 12 outliers among 100 measurements (12.00%)
+  12 (12.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t1000_o100: Collecting 100 samples in estimated 5.003
+extend_sorted_vec_comparison/extend_sorted_vec_new/t1000_o100
+                        time:   [1.8046 µs 1.8248 µs 1.8443 µs]
+                        change: [-1.3561% -0.3031% +0.7708%] (p = 0.58 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  7 (7.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t1000_o1000: Collecting 100 samples in estimated 5.0514 s
+extend_sorted_vec_comparison/extend_sorted_vec/t1000_o1000
+                        time:   [3.9407 µs 3.9857 µs 4.0257 µs]
+                        change: [-7.9319% -3.3891% +1.5232%] (p = 0.17 > 0.05)
+                        No change in performance detected.
+Found 13 outliers among 100 measurements (13.00%)
+  5 (5.00%) low severe
+  8 (8.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t1000_o1000: Collecting 100 samples in estimated 5
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t1000_o1000
+                        time:   [5.1168 µs 5.1577 µs 5.1960 µs]
+                        change: [-9.3461% -6.7779% -4.2541%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 14 outliers among 100 measurements (14.00%)
+  13 (13.00%) low severe
+  1 (1.00%) low mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t1000_o1000: Collecting 100 samples in estimated 5.04
+extend_sorted_vec_comparison/extend_sorted_vec_new/t1000_o1000
+                        time:   [4.1382 µs 4.2008 µs 4.2548 µs]
+                        change: [-8.0865% -4.1741% +0.0446%] (p = 0.05 < 0.05)
+                        Change within noise threshold.
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t1000_o5000: Collecting 100 samples in estimated 5.1300 s
+extend_sorted_vec_comparison/extend_sorted_vec/t1000_o5000
+                        time:   [10.445 µs 10.594 µs 10.751 µs]
+                        change: [-6.1159% -3.3745% -0.3193%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Found 21 outliers among 100 measurements (21.00%)
+  5 (5.00%) low severe
+  13 (13.00%) low mild
+  3 (3.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t1000_o5000: Collecting 100 samples in estimated 5
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t1000_o5000
+                        time:   [10.599 µs 10.734 µs 10.875 µs]
+                        change: [-7.5046% -4.1197% -0.8750%] (p = 0.02 < 0.05)
+                        Change within noise threshold.
+Found 11 outliers among 100 measurements (11.00%)
+  7 (7.00%) low mild
+  4 (4.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t1000_o5000: Collecting 100 samples in estimated 5.04
+extend_sorted_vec_comparison/extend_sorted_vec_new/t1000_o5000
+                        time:   [13.488 µs 13.624 µs 13.764 µs]
+                        change: [-6.6598% -5.2065% -3.6236%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low severe
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t5000_o10: Collecting 100 samples in estimated 5.0100 s (
+extend_sorted_vec_comparison/extend_sorted_vec/t5000_o10
+                        time:   [5.0674 µs 5.0860 µs 5.1058 µs]
+                        change: [-0.1515% +0.3238% +0.7737%] (p = 0.18 > 0.05)
+                        No change in performance detected.
+Found 8 outliers among 100 measurements (8.00%)
+  8 (8.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t5000_o10: Collecting 100 samples in estimated 5.0
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t5000_o10
+                        time:   [4.3726 µs 4.5750 µs 4.7800 µs]
+                        change: [-17.264% -8.3874% +1.3696%] (p = 0.11 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t5000_o10: Collecting 100 samples in estimated 5.0015
+extend_sorted_vec_comparison/extend_sorted_vec_new/t5000_o10
+                        time:   [8.3291 µs 8.4315 µs 8.5656 µs]
+                        change: [-1.7949% +2.2401% +7.8042%] (p = 0.45 > 0.05)
+                        No change in performance detected.
+Found 13 outliers among 100 measurements (13.00%)
+  5 (5.00%) high mild
+  8 (8.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t5000_o100: Collecting 100 samples in estimated 5.0381 s 
+extend_sorted_vec_comparison/extend_sorted_vec/t5000_o100
+                        time:   [5.0735 µs 5.0879 µs 5.1019 µs]
+                        change: [-0.7408% -0.3786% -0.0087%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t5000_o100: Collecting 100 samples in estimated 5.
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t5000_o100
+                        time:   [4.4933 µs 4.6978 µs 4.9221 µs]
+                        change: [-10.337% -4.0392% +2.0116%] (p = 0.23 > 0.05)
+                        No change in performance detected.
+Found 6 outliers among 100 measurements (6.00%)
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t5000_o100: Collecting 100 samples in estimated 5.023
+extend_sorted_vec_comparison/extend_sorted_vec_new/t5000_o100
+                        time:   [8.7555 µs 8.9341 µs 9.1163 µs]
+                        change: [+2.7255% +4.1960% +5.7618%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t5000_o1000: Collecting 100 samples in estimated 5.0195 s
+extend_sorted_vec_comparison/extend_sorted_vec/t5000_o1000
+                        time:   [5.3954 µs 5.4126 µs 5.4294 µs]
+                        change: [-1.1008% -0.7043% -0.2567%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t5000_o1000: Collecting 100 samples in estimated 5
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t5000_o1000
+                        time:   [7.4388 µs 7.6679 µs 7.9125 µs]
+                        change: [-2.2693% +1.0106% +4.2362%] (p = 0.56 > 0.05)
+                        No change in performance detected.
+Found 6 outliers among 100 measurements (6.00%)
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t5000_o1000: Collecting 100 samples in estimated 5.01
+extend_sorted_vec_comparison/extend_sorted_vec_new/t5000_o1000
+                        time:   [9.1715 µs 9.3684 µs 9.5772 µs]
+                        change: [+1.8701% +4.4278% +7.3381%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec/t5000_o5000: Collecting 100 samples in estimated 5.0534 s
+extend_sorted_vec_comparison/extend_sorted_vec/t5000_o5000
+                        time:   [18.643 µs 19.098 µs 19.617 µs]
+                        change: [+0.4751% +3.7494% +7.0367%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_custom/t5000_o5000: Collecting 100 samples in estimated 5
+extend_sorted_vec_comparison/extend_sorted_vec_custom/t5000_o5000
+                        time:   [23.386 µs 23.530 µs 23.680 µs]
+                        change: [-3.4225% +1.0525% +7.9926%] (p = 0.78 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  5 (5.00%) low mild
+  2 (2.00%) high mild
+  3 (3.00%) high severe
+Benchmarking extend_sorted_vec_comparison/extend_sorted_vec_new/t5000_o5000: Collecting 100 samples in estimated 5.22
+extend_sorted_vec_comparison/extend_sorted_vec_new/t5000_o5000
+                        time:   [21.304 µs 22.028 µs 22.830 µs]
+                        change: [+0.5018% +5.1679% +10.043%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Found 9 outliers among 100 measurements (9.00%)
+  5 (5.00%) high mild
+  4 (4.00%) high severe
+
+
+Benchmarking: target=100000, other=93000, overlap=50%
+Benchmarking extend_sorted_vec_large/default/t100000_o93000_overlap50%: Collecting 20 samples in estimated 5.2249 s (
+extend_sorted_vec_large/default/t100000_o93000_overlap50%
+                        time:   [1.0950 ms 1.1806 ms 1.2763 ms]
+                        change: [-18.782% -10.665% -0.9973%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Benchmarking extend_sorted_vec_large/merge/t100000_o93000_overlap50%: Collecting 20 samples in estimated 5.4359 s (21
+extend_sorted_vec_large/merge/t100000_o93000_overlap50%
+                        time:   [686.75 µs 821.87 µs 998.23 µs]
+                        change: [+8.9006% +28.685% +52.403%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking extend_sorted_vec_large/itertool_merge/t100000_o93000_overlap50%: Collecting 20 samples in estimated 5.5
+extend_sorted_vec_large/itertool_merge/t100000_o93000_overlap50%
+                        time:   [1.2184 ms 1.3912 ms 1.5818 ms]
+                        change: [-7.6449% -0.9472% +5.9918%] (p = 0.79 > 0.05)
+                        No change in performance detected.
+
+Benchmarking: target=100000, other=93000, overlap=10%
+Benchmarking extend_sorted_vec_large/default/t100000_o93000_overlap10%: Collecting 20 samples in estimated 5.0022 s (
+extend_sorted_vec_large/default/t100000_o93000_overlap10%
+                        time:   [1.3431 ms 1.4182 ms 1.4962 ms]
+                        change: [-10.941% -4.7354% +1.8117%] (p = 0.18 > 0.05)
+                        No change in performance detected.
+Benchmarking extend_sorted_vec_large/merge/t100000_o93000_overlap10%: Collecting 20 samples in estimated 5.2883 s (21
+extend_sorted_vec_large/merge/t100000_o93000_overlap10%
+                        time:   [803.62 µs 920.35 µs 1.0397 ms]
+                        change: [-23.044% -13.016% -0.7572%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking extend_sorted_vec_large/itertool_merge/t100000_o93000_overlap10%: Collecting 20 samples in estimated 5.4
+extend_sorted_vec_large/itertool_merge/t100000_o93000_overlap10%
+                        time:   [1.1674 ms 1.3702 ms 1.5639 ms]
+                        change: [-13.602% -5.7132% +0.5392%] (p = 0.15 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) low severe
+
+Benchmarking: target=100000, other=93000, overlap=90%
+Benchmarking extend_sorted_vec_large/default/t100000_o93000_overlap90%: Collecting 20 samples in estimated 5.3619 s (
+extend_sorted_vec_large/default/t100000_o93000_overlap90%
+                        time:   [1.0284 ms 1.0853 ms 1.1454 ms]
+                        change: [-4.5394% +1.1791% +7.4894%] (p = 0.69 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high mild
+Benchmarking extend_sorted_vec_large/merge/t100000_o93000_overlap90%: Collecting 20 samples in estimated 5.4657 s (21
+extend_sorted_vec_large/merge/t100000_o93000_overlap90%
+                        time:   [687.62 µs 826.02 µs 985.12 µs]
+                        change: [+3.3685% +17.723% +33.383%] (p = 0.03 < 0.05)
+                        Performance has regressed.
+Benchmarking extend_sorted_vec_large/itertool_merge/t100000_o93000_overlap90%: Collecting 20 samples in estimated 5.4
+extend_sorted_vec_large/itertool_merge/t100000_o93000_overlap90%
+                        time:   [1.1458 ms 1.1912 ms 1.2374 ms]
+                        change: [-12.118% -1.2778% +13.235%] (p = 0.85 > 0.05)
+                        No change in performance detected.
+
+Benchmarking: target=10000, other=10000, overlap=50%
+Benchmarking extend_sorted_vec_large/default/t10000_o10000_overlap50%: Collecting 20 samples in estimated 5.0026 s (1
+extend_sorted_vec_large/default/t10000_o10000_overlap50%
+                        time:   [61.260 µs 68.270 µs 76.348 µs]
+                        change: [-13.256% +0.3788% +16.101%] (p = 0.96 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking extend_sorted_vec_large/merge/t10000_o10000_overlap50%: Collecting 20 samples in estimated 5.0549 s (17k
+extend_sorted_vec_large/merge/t10000_o10000_overlap50%
+                        time:   [77.579 µs 91.893 µs 103.86 µs]
+                        change: [-9.8482% +8.2559% +30.137%] (p = 0.43 > 0.05)
+                        No change in performance detected.
+Benchmarking extend_sorted_vec_large/itertool_merge/t10000_o10000_overlap50%: Collecting 20 samples in estimated 5.04
+extend_sorted_vec_large/itertool_merge/t10000_o10000_overlap50%
+                        time:   [72.341 µs 84.614 µs 97.488 µs]
+                        change: [-1.2519% +17.161% +37.627%] (p = 0.08 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+
+Benchmarking: target=1000, other=1000, overlap=50%
+Benchmarking extend_sorted_vec_large/default/t1000_o1000_overlap50%: Collecting 20 samples in estimated 5.0037 s (128
+extend_sorted_vec_large/default/t1000_o1000_overlap50%
+                        time:   [9.2932 µs 10.215 µs 11.632 µs]
+                        change: [-35.731% -24.691% -10.822%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high mild
+Benchmarking extend_sorted_vec_large/merge/t1000_o1000_overlap50%: Collecting 20 samples in estimated 5.0041 s (140k 
+extend_sorted_vec_large/merge/t1000_o1000_overlap50%
+                        time:   [10.474 µs 11.694 µs 12.764 µs]
+                        change: [-9.4047% +5.6489% +23.671%] (p = 0.49 > 0.05)
+                        No change in performance detected.
+Benchmarking extend_sorted_vec_large/itertool_merge/t1000_o1000_overlap50%: Collecting 20 samples in estimated 5.0066
+extend_sorted_vec_large/itertool_merge/t1000_o1000_overlap50%
+                        time:   [11.552 µs 12.869 µs 14.164 µs]
+                        change: [-11.551% +1.0130% +14.412%] (p = 0.87 > 0.05)
+                        No change in performance detected.

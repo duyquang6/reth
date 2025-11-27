@@ -136,3 +136,11 @@ rayon = ["dep:rayon"]
 [[bench]]
 name = "prefix_set"
 harness = false
+
+[[bench]]
+name = "extend_ref"
+harness = false
+
+[[bench]]
+name = "extend_sorted_vec"
+harness = false

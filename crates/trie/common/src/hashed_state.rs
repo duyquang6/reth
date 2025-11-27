@@ -1,10 +1,7 @@
 use core::ops::Not;
 
 use crate::{
-    added_removed_keys::MultiAddedRemovedKeys,
-    prefix_set::{PrefixSetMut, TriePrefixSetsMut},
-    utils::extend_sorted_vec,
-    KeyHasher, MultiProofTargets, Nibbles,
+    KeyHasher, MultiProofTargets, Nibbles, added_removed_keys::MultiAddedRemovedKeys, prefix_set::{PrefixSetMut, TriePrefixSetsMut}, utils::{extend_sorted_vec, extend_sorted_vec_custom, extend_sorted_vec_new}
 };
 use alloc::{borrow::Cow, vec::Vec};
 use alloy_primitives::{
@@ -587,6 +584,36 @@ impl HashedPostStateSorted {
         }
     }
 
+    /// Extends this state with contents of another sorted state.
+    /// Entries in `other` take precedence for duplicate keys.
+    pub fn extend_ref_custom(&mut self, other: &Self) {
+        // Extend accounts
+        extend_sorted_vec_custom(&mut self.accounts, &other.accounts);
+
+        // Extend storages
+        for (hashed_address, other_storage) in &other.storages {
+            self.storages
+                .entry(*hashed_address)
+                .and_modify(|existing| existing.extend_ref_custom(other_storage))
+                .or_insert_with(|| other_storage.clone());
+        }
+    }
+
+    /// Extends this state with contents of another sorted state.
+    /// Entries in `other` take precedence for duplicate keys.
+    pub fn extend_ref_new(&mut self, other: &Self) {
+        // Extend accounts
+        extend_sorted_vec_new(&mut self.accounts, &other.accounts);
+
+        // Extend storages
+        for (hashed_address, other_storage) in &other.storages {
+            self.storages
+                .entry(*hashed_address)
+                .and_modify(|existing| existing.extend_ref_new(other_storage))
+                .or_insert_with(|| other_storage.clone());
+        }
+    }
+
     /// Clears all accounts and storage data.
     pub fn clear(&mut self) {
         self.accounts.clear();
@@ -645,6 +672,40 @@ impl HashedStorageSorted {
 
         // Extend the sorted non-zero valued slots
         extend_sorted_vec(&mut self.storage_slots, &other.storage_slots);
+    }
+
+        /// Extends the storage slots updates with another set of sorted updates.
+    ///
+    /// If `other` is marked as deleted, this will be marked as deleted and all slots cleared.
+    /// Otherwise, nodes are merged with `other`'s values taking precedence for duplicates.
+    pub fn extend_ref_new(&mut self, other: &Self) {
+        if other.wiped {
+            // If other is wiped, clear everything and copy from other
+            self.wiped = true;
+            self.storage_slots.clear();
+            self.storage_slots.extend(other.storage_slots.iter().copied());
+            return;
+        }
+
+        // Extend the sorted non-zero valued slots
+        extend_sorted_vec_new(&mut self.storage_slots, &other.storage_slots);
+    }
+
+            /// Extends the storage slots updates with another set of sorted updates.
+    ///
+    /// If `other` is marked as deleted, this will be marked as deleted and all slots cleared.
+    /// Otherwise, nodes are merged with `other`'s values taking precedence for duplicates.
+    pub fn extend_ref_custom(&mut self, other: &Self) {
+        if other.wiped {
+            // If other is wiped, clear everything and copy from other
+            self.wiped = true;
+            self.storage_slots.clear();
+            self.storage_slots.extend(other.storage_slots.iter().copied());
+            return;
+        }
+
+        // Extend the sorted non-zero valued slots
+        extend_sorted_vec_custom(&mut self.storage_slots, &other.storage_slots);
     }
 }
 

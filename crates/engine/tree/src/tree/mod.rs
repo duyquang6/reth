@@ -2238,7 +2238,7 @@ where
     ///
     /// This is invoked on a valid forkchoice update, or if we can make the target block canonical.
     fn on_canonical_chain_update(&mut self, chain_update: NewCanonicalChain<N>) {
-        trace!(target: "engine::tree", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count(), "applying new chain update");
+        debug!(target: "engine::tree", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count(), "applying new chain update");
         let start = Instant::now();
 
         // update the tracked canonical head
@@ -2251,7 +2251,7 @@ where
         if let NewCanonicalChain::Reorg { new, old } = &chain_update {
             let new_first = new.first().map(|first| first.recovered_block().num_hash());
             let old_first = old.first().map(|first| first.recovered_block().num_hash());
-            trace!(target: "engine::tree", ?new_first, ?old_first, "Reorg detected, new and old first blocks");
+            debug!(target: "engine::tree", ?new_first, ?old_first, "Reorg detected, new and old first blocks");
 
             self.update_reorg_metrics(old.len());
             self.reinsert_reorged_blocks(new.clone());
