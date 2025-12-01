@@ -6,8 +6,7 @@ use alloy_eips::eip2718::Encodable2718;
 use reth_db_api::{table::Value, transaction::DbTxMut};
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
-    providers::StaticFileProvider, BlockReader, ChainStateBlockReader, DBProvider,
-    PruneCheckpointReader, PruneCheckpointWriter, StaticFileProviderFactory, StorageSettingsCache,
+    BlockReader, ChainStateBlockReader, DBProvider, PruneCheckpointReader, PruneCheckpointWriter, RocksDBProviderFactory, StaticFileProviderFactory, StorageSettingsCache, providers::StaticFileProvider
 };
 use reth_prune_types::PruneModes;
 
@@ -52,7 +51,8 @@ where
         + PruneCheckpointReader
         + BlockReader<Transaction: Encodable2718>
         + ChainStateBlockReader
-        + StorageSettingsCache,
+        + StorageSettingsCache
+        + RocksDBProviderFactory,
 {
     /// Creates a [`SegmentSet`] from an existing components, such as [`StaticFileProvider`] and
     /// [`PruneModes`].

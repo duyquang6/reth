@@ -3,7 +3,7 @@ use alloy_primitives::{TxHash, TxNumber};
 use num_traits::Zero;
 use reth_config::config::{EtlConfig, TransactionLookupConfig};
 use reth_db_api::{
-    cursor::{DbCursorRO, DbCursorRW},
+    cursor::DbCursorRW,
     table::Value,
     tables,
     transaction::DbTxMut,
@@ -12,8 +12,9 @@ use reth_db_api::{
 use reth_etl::Collector;
 use reth_primitives_traits::{NodePrimitives, SignedTransaction};
 use reth_provider::{
-    BlockReader, DBProvider, PruneCheckpointReader, PruneCheckpointWriter,
-    StaticFileProviderFactory, StatsReader, TransactionsProvider, TransactionsProviderExt,
+    BlockReader, DBProvider, EitherWriter, EitherWriterDestination, PruneCheckpointReader,
+    PruneCheckpointWriter, RocksDBProviderFactory, StaticFileProviderFactory, StatsReader,
+    StorageSettingsCache, TransactionsProvider, TransactionsProviderExt,
 };
 use reth_prune_types::{PruneCheckpoint, PruneMode, PrunePurpose, PruneSegment};
 use reth_stages_api::{
@@ -65,7 +66,9 @@ where
         + PruneCheckpointReader
         + StatsReader
         + StaticFileProviderFactory<Primitives: NodePrimitives<SignedTx: Value + SignedTransaction>>
-        + TransactionsProviderExt,
+        + TransactionsProviderExt
+        + RocksDBProviderFactory
+        + StorageSettingsCache
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -152,28 +155,65 @@ where
             if range_output.is_final_range {
                 let append_only =
                     provider.count_entries::<tables::TransactionHashNumbers>()?.is_zero();
-                let mut txhash_cursor = provider
-                    .tx_ref()
-                    .cursor_write::<tables::RawTable<tables::TransactionHashNumbers>>()?;
 
                 let total_hashes = hash_collector.len();
                 let interval = (total_hashes / 10).max(1);
-                for (index, hash_to_number) in hash_collector.iter()?.enumerate() {
-                    let (hash, number) = hash_to_number?;
-                    if index > 0 && index.is_multiple_of(interval) {
-                        info!(
-                            target: "sync::stages::transaction_lookup",
-                            ?append_only,
-                            progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
-                            "Inserting hashes"
-                        );
-                    }
 
-                    let key = RawKey::<TxHash>::from_vec(hash);
-                    if append_only {
-                        txhash_cursor.append(key, &RawValue::<TxNumber>::from_vec(number))?
-                    } else {
-                        txhash_cursor.insert(key, &RawValue::<TxNumber>::from_vec(number))?
+                // Write all transaction hash numbers using raw bytes from ETL collector
+                // We iterate and convert lazily to avoid collecting all data into memory
+                // Determine destination based on storage settings
+                match EitherWriter::transaction_hash_numbers_destination(provider) {
+                    EitherWriterDestination::RocksDB => {
+                        // Use RocksDB write_batch API
+                        provider.rocksdb_provider().write_batch(|batch| {
+                            for (index, result) in hash_collector.iter()?.enumerate() {
+                                // Progress logging
+                                if index > 0 && index.is_multiple_of(interval) {
+                                    info!(
+                                        target: "sync::stages::transaction_lookup",
+                                        ?append_only,
+                                        progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
+                                        "Inserting hashes"
+                                    );
+                                }
+
+                                // Write to RocksDB
+                                let (hash, number) = result?;
+                                let tx_hash = RawKey::<TxHash>::from_vec(hash).key()?;
+                                let tx_num = RawValue::<TxNumber>::from_vec(number).value()?;
+                                batch.put::<tables::TransactionHashNumbers>(tx_hash, &tx_num)?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    EitherWriterDestination::Database => {
+                        // Use Database cursor
+                        let mut cursor = provider.tx_ref().cursor_write::<tables::TransactionHashNumbers>()?;
+                        for (index, result) in hash_collector.iter()?.enumerate() {
+                            // Progress logging
+                            if index > 0 && index.is_multiple_of(interval) {
+                                info!(
+                                    target: "sync::stages::transaction_lookup",
+                                    ?append_only,
+                                    progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
+                                    "Inserting hashes"
+                                );
+                            }
+                            
+                            // Write to database
+                            let (hash, number) = result?;
+                            let tx_hash = RawKey::<TxHash>::from_vec(hash).key()?;
+                            let tx_num = RawValue::<TxNumber>::from_vec(number).value()?;
+                            
+                            if append_only {
+                                cursor.append(tx_hash, &tx_num)?;
+                            } else {
+                                cursor.insert(tx_hash, &tx_num)?;
+                            }
+                        }
+                    }
+                    EitherWriterDestination::StaticFile => {
+                        unreachable!("Transaction hash numbers should not be written to static files")
                     }
                 }
 
@@ -199,11 +239,10 @@ where
         provider: &Provider,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
-        let tx = provider.tx_ref();
         let (range, unwind_to, _) = input.unwind_block_range_with_threshold(self.chunk_size);
 
-        // Cursor to unwind tx hash to number
-        let mut tx_hash_number_cursor = tx.cursor_write::<tables::TransactionHashNumbers>()?;
+        // Use EitherWriter to delete tx hash numbers
+        let mut tx_hash_writer = EitherWriter::new_transaction_hash_numbers(provider)?;
         let static_file_provider = provider.static_file_provider();
         let rev_walker = provider
             .block_body_indices_range(range.clone())?
@@ -211,20 +250,21 @@ where
             .zip(range.collect::<Vec<_>>())
             .rev();
 
+        // Collect all transaction hashes to delete
         for (body, number) in rev_walker {
             if number <= unwind_to {
                 break;
             }
 
-            // Delete all transactions that belong to this block
-            for tx_id in body.tx_num_range() {
-                // First delete the transaction and hash to id mapping
-                if let Some(transaction) = static_file_provider.transaction_by_id(tx_id)? &&
-                    tx_hash_number_cursor.seek_exact(transaction.trie_hash())?.is_some()
-                {
-                    tx_hash_number_cursor.delete_current()?;
-                }
-            }
+            let delete_tx_hashes = body.tx_num_range()
+                .filter_map(|tx_id| {
+                    static_file_provider.transaction_by_id(tx_id)
+                        .ok()
+                        .flatten()
+                        .map(|tx| TxHash::from(*tx.trie_hash()))
+                });
+
+            tx_hash_writer.delete_transaction_hash_numbers(delete_tx_hashes)?;
         }
 
         Ok(UnwindOutput {

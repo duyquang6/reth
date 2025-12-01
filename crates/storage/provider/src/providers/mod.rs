@@ -31,9 +31,10 @@ pub use consistent::ConsistentProvider;
 
 // RocksDB currently only supported on Unix platforms
 // Windows support is planned for future releases
-#[cfg(unix)]
+#[cfg_attr(unix, path = "rocksdb/mod.rs")]
+#[cfg_attr(not(unix), path = "rocksdb_stub.rs")]
 mod rocksdb;
-#[cfg(unix)]
+
 pub use rocksdb::{RocksDBBuilder, RocksDBProvider};
 
 /// Helper trait to bound [`NodeTypes`] so that combined with database they satisfy

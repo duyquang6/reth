@@ -250,6 +250,12 @@ impl From<ConsistentViewError> for ProviderError {
     }
 }
 
+impl From<std::io::Error> for ProviderError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Database(DatabaseError::Other(err.to_string().into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,16 +19,26 @@ pub struct StorageSettings {
     /// Whether this node always writes transaction senders to static files.
     #[serde(default)]
     pub transaction_senders_in_static_files: bool,
+    /// Whether this node stores transaction hash numbers in RocksDB.
+    ///
+    /// If this is set to TRUE, transaction hash lookups will be stored in and retrieved from
+    /// RocksDB instead of MDBX. This is the default for new nodes.
+    #[serde(default)]
+    pub transaction_hash_numbers_in_rocksdb: bool,
 }
 
 impl StorageSettings {
     /// Creates `StorageSettings` for legacy nodes.
     ///
     /// This explicitly sets `receipts_in_static_files` and `transaction_senders_in_static_files` to
-    /// `false`, ensuring older nodes continue writing receipts and transaction senders to the
+    /// `false`, ensuring older nodes continue writing receipts, transaction senders and transaction hash numbers to the
     /// database when receipt pruning is enabled.
     pub const fn legacy() -> Self {
-        Self { receipts_in_static_files: false, transaction_senders_in_static_files: false }
+        Self {
+            receipts_in_static_files: false,
+            transaction_senders_in_static_files: false,
+            transaction_hash_numbers_in_rocksdb: false,
+        }
     }
 
     /// Sets the `receipts_in_static_files` flag to the provided value.
@@ -41,5 +51,16 @@ impl StorageSettings {
     pub const fn with_transaction_senders_in_static_files(mut self, value: bool) -> Self {
         self.transaction_senders_in_static_files = value;
         self
+    }
+}
+
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            receipts_in_static_files: true,
+            transaction_senders_in_static_files: true,
+            // RocksDB is only supported on Unix platforms
+            transaction_hash_numbers_in_rocksdb: cfg!(unix),
+        }
     }
 }
