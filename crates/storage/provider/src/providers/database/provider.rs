@@ -4,6 +4,7 @@ use crate::{
     },
     providers::{
         database::{chain::ChainStorage, metrics},
+        rocksdb::RocksDBProvider,
         static_file::StaticFileWriter,
         NodeTypesForProvider, StaticFileProvider,
     },
@@ -16,10 +17,10 @@ use crate::{
     DBProvider, EitherReader, EitherWriter, EitherWriterDestination, HashingWriter, HeaderProvider,
     HeaderSyncGapProvider, HistoricalStateProvider, HistoricalStateProviderRef, HistoryWriter,
     LatestStateProvider, LatestStateProviderRef, OriginalValuesKnown, ProviderError,
-    PruneCheckpointReader, PruneCheckpointWriter, RevertsInit, StageCheckpointReader,
-    StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader, StorageReader,
-    StorageTrieWriter, TransactionVariant, TransactionsProvider, TransactionsProviderExt,
-    TrieReader, TrieWriter,
+    PruneCheckpointReader, PruneCheckpointWriter, RevertsInit, RocksDBProviderFactory,
+    StageCheckpointReader, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader,
+    StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
+    TransactionsProviderExt, TrieReader, TrieWriter,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta, TxHashRef},
@@ -164,6 +165,8 @@ pub struct DatabaseProvider<TX, N: NodeTypes> {
     storage: Arc<N::Storage>,
     /// Storage configuration settings for this node
     storage_settings: Arc<RwLock<StorageSettings>>,
+    /// RocksDB provider for transaction hash lookups
+    rocksdb_provider: RocksDBProvider,
     /// Minimum distance from tip required for pruning
     minimum_pruning_distance: u64,
 }
@@ -251,6 +254,13 @@ impl<TX, N: NodeTypes> StaticFileProviderFactory for DatabaseProvider<TX, N> {
     }
 }
 
+impl<TX, N: NodeTypes> RocksDBProviderFactory for DatabaseProvider<TX, N> {
+    /// Returns a reference to the RocksDB provider.
+    fn rocksdb_provider(&self) -> &RocksDBProvider {
+        &self.rocksdb_provider
+    }
+}
+
 impl<TX: Debug + Send + Sync, N: NodeTypes<ChainSpec: EthChainSpec + 'static>> ChainSpecProvider
     for DatabaseProvider<TX, N>
 {
@@ -270,6 +280,7 @@ impl<TX: DbTxMut, N: NodeTypes> DatabaseProvider<TX, N> {
         prune_modes: PruneModes,
         storage: Arc<N::Storage>,
         storage_settings: Arc<RwLock<StorageSettings>>,
+        rocksdb_provider: RocksDBProvider,
     ) -> Self {
         Self {
             tx,
@@ -278,6 +289,7 @@ impl<TX: DbTxMut, N: NodeTypes> DatabaseProvider<TX, N> {
             prune_modes,
             storage,
             storage_settings,
+            rocksdb_provider,
             minimum_pruning_distance: MINIMUM_PRUNING_DISTANCE,
         }
     }
@@ -523,6 +535,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         prune_modes: PruneModes,
         storage: Arc<N::Storage>,
         storage_settings: Arc<RwLock<StorageSettings>>,
+        rocksdb_provider: RocksDBProvider,
     ) -> Self {
         Self {
             tx,
@@ -531,6 +544,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
             prune_modes,
             storage,
             storage_settings,
+            rocksdb_provider,
             minimum_pruning_distance: MINIMUM_PRUNING_DISTANCE,
         }
     }
@@ -555,6 +569,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         &self.chain_spec
     }
 }
+
 
 impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     fn recovered_block<H, HF, B, BF>(
@@ -1235,6 +1250,11 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
     type Transaction = TxTy<N>;
 
     fn transaction_id(&self, tx_hash: TxHash) -> ProviderResult<Option<TxNumber>> {
+        // Route to RocksDB if enabled
+        if self.storage_settings.read().transaction_hash_numbers_in_rocksdb {
+            return self.rocksdb_provider.get::<tables::TransactionHashNumbers>(tx_hash);
+        }
+        // Otherwise use MDBX
         Ok(self.tx.get::<tables::TransactionHashNumbers>(tx_hash)?)
     }
 
@@ -2867,10 +2887,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
         }
 
         if self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full()) {
-            for (tx_num, transaction) in tx_nums_iter.zip(block.body().transactions_iter()) {
-                let hash = transaction.tx_hash();
-                self.tx.put::<tables::TransactionHashNumbers>(*hash, tx_num)?;
-            }
+            let mut tx_hash_writer = EitherWriter::new_transaction_hash_numbers(self)?;
+            tx_hash_writer.insert_transaction_hash_numbers(
+                tx_nums_iter.zip(block.body().transactions_iter())
+                    .map(|(tx_num, transaction)| (*transaction.tx_hash(), tx_num))
+            )?;
             durations_recorder.record_relative(metrics::Action::InsertTransactionHashNumbers);
         }
 
@@ -2978,9 +2999,12 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             .last_tx_num();
 
         if unwind_tx_from <= unwind_tx_to {
-            for (hash, _) in self.transaction_hashes_by_range(unwind_tx_from..(unwind_tx_to + 1))? {
-                self.tx.delete::<tables::TransactionHashNumbers>(hash, None)?;
-            }
+            let mut tx_hash_writer = EitherWriter::new_transaction_hash_numbers(self)?;
+            tx_hash_writer.delete_transaction_hash_numbers(
+                self.transaction_hashes_by_range(unwind_tx_from..(unwind_tx_to + 1))?
+                    .into_iter()
+                    .map(|(hash, _)| hash)
+            )?;
         }
 
         EitherWriter::new_senders(self, last_block_number)?.prune_senders(unwind_tx_from, block)?;

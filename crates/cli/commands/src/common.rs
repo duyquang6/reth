@@ -21,7 +21,7 @@ use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
 };
 use reth_provider::{
-    providers::{BlockchainProvider, NodeTypesForProvider, StaticFileProvider},
+    providers::{BlockchainProvider, NodeTypesForProvider, RocksDBProvider, StaticFileProvider},
     ProviderFactory, StaticFileProviderFactory,
 };
 use reth_stages::{sets::DefaultStages, Pipeline, PipelineTarget};
@@ -107,7 +107,18 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             ),
         };
 
-        let provider_factory = self.create_provider_factory(&config, db, sfp, access)?;
+        // Initialize RocksDB provider
+        let mut builder = RocksDBProvider::builder(&data_dir.rocksdb())
+            .with_metrics()
+            .with_statistics();
+
+        if let Some(log_level) = self.db.log_level {
+            builder = builder.with_database_log_level(log_level);
+        }
+
+        let rocksdb_provider = builder.build()?;
+
+        let provider_factory = self.create_provider_factory(&config, db, sfp, rocksdb_provider, access)?;
         if access.is_read_write() {
             debug!(target: "reth::cli", chain=%self.chain.chain(), genesis=?self.chain.genesis_hash(), "Initializing genesis");
             init_genesis_with_settings(&provider_factory, self.static_files.to_settings())?;
@@ -126,6 +137,7 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         config: &Config,
         db: Arc<DatabaseEnv>,
         static_file_provider: StaticFileProvider<N::Primitives>,
+        rocksdb_provider: RocksDBProvider,
         access: AccessRights,
     ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>>
     where
@@ -136,6 +148,7 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             db,
             self.chain.clone(),
             static_file_provider,
+            rocksdb_provider,
         )?
         .with_prune_modes(prune_modes.clone());
 

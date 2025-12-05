@@ -4,7 +4,7 @@
 //! up to the intended build target.
 
 use crate::{
-    providers::{NodeTypesForProvider, StaticFileProvider},
+    providers::{NodeTypesForProvider, RocksDBProvider, StaticFileProvider},
     ProviderFactory,
 };
 use reth_db::{
@@ -106,9 +106,21 @@ impl<N> ProviderFactoryBuilder<N> {
     {
         let ReadOnlyConfig { db_dir, db_args, static_files_dir, watch_static_files } =
             config.into();
+        
+        // Initialize RocksDB provider for read-only access
+        let rocksdb_path = db_dir.join("rocksdb");
+        #[cfg(unix)]
+        let rocksdb_provider = RocksDBProvider::builder(&rocksdb_path)
+            .with_metrics()
+            .with_statistics()
+            .build()?;
+        #[cfg(not(unix))]
+        let rocksdb_provider = RocksDBProvider;
+        
         self.db(Arc::new(open_db_read_only(db_dir, db_args)?))
             .chainspec(chainspec)
             .static_file(StaticFileProvider::read_only(static_files_dir, watch_static_files)?)
+            .rocksdb_provider(rocksdb_provider)
             .build_provider_factory()
             .map_err(Into::into)
     }
@@ -317,7 +329,37 @@ impl<N, Val1, Val2, Val3> TypesAnd3<N, Val1, Val2, Val3> {
     }
 }
 
-impl<N, DB> TypesAnd3<N, DB, Arc<N::ChainSpec>, StaticFileProvider<N::Primitives>>
+impl<N, DB, C> TypesAnd3<N, DB, Arc<C>, StaticFileProvider<N::Primitives>>
+where
+    N: NodeTypes,
+{
+    /// Configures the RocksDB provider.
+    pub fn rocksdb_provider(
+        self,
+        rocksdb_provider: crate::providers::RocksDBProvider,
+    ) -> TypesAnd4<N, DB, Arc<C>, StaticFileProvider<N::Primitives>, crate::providers::RocksDBProvider> {
+        TypesAnd4::new(self.val_1, self.val_2, self.val_3, rocksdb_provider)
+    }
+}
+
+/// This is staging type that contains the configured types and _four_ values.
+#[derive(Debug)]
+pub struct TypesAnd4<N, Val1, Val2, Val3, Val4> {
+    _types: PhantomData<N>,
+    val_1: Val1,
+    val_2: Val2,
+    val_3: Val3,
+    val_4: Val4,
+}
+
+impl<N, Val1, Val2, Val3, Val4> TypesAnd4<N, Val1, Val2, Val3, Val4> {
+    /// Creates a new instance with the given types and four values.
+    pub fn new(val_1: Val1, val_2: Val2, val_3: Val3, val_4: Val4) -> Self {
+        Self { _types: Default::default(), val_1, val_2, val_3, val_4 }
+    }
+}
+
+impl<N, DB> TypesAnd4<N, DB, Arc<N::ChainSpec>, StaticFileProvider<N::Primitives>, crate::providers::RocksDBProvider>
 where
     N: NodeTypesForProvider,
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
@@ -326,7 +368,7 @@ where
     pub fn build_provider_factory(
         self,
     ) -> ProviderResult<ProviderFactory<NodeTypesWithDBAdapter<N, DB>>> {
-        let Self { _types, val_1, val_2, val_3 } = self;
-        ProviderFactory::new(val_1, val_2, val_3)
+        let Self { _types, val_1, val_2, val_3, val_4 } = self;
+        ProviderFactory::new(val_1, val_2, val_3, val_4)
     }
 }

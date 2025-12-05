@@ -4,17 +4,16 @@
 use std::ops::Range;
 
 use crate::{
-    providers::{StaticFileProvider, StaticFileProviderRWRefMut},
-    StaticFileProviderFactory,
+    providers::{RocksDBProvider, StaticFileProvider, StaticFileProviderRWRefMut},
+    RocksDBProviderFactory, StaticFileProviderFactory,
 };
-use alloy_primitives::{map::HashMap, Address, BlockNumber, TxNumber};
+use alloy_primitives::{map::HashMap, Address, BlockNumber, TxHash, TxNumber};
 use reth_db::{
-    cursor::DbCursorRO,
     static_file::TransactionSenderMask,
     table::Value,
     transaction::{CursorMutTy, CursorTy, DbTx, DbTxMut},
 };
-use reth_db_api::{cursor::DbCursorRW, tables};
+use reth_db_api::{cursor::{DbCursorRO, DbCursorRW}, tables};
 use reth_errors::ProviderError;
 use reth_node_types::NodePrimitives;
 use reth_primitives_traits::ReceiptTy;
@@ -34,16 +33,36 @@ type EitherWriterTy<'a, P, T> = EitherWriter<
     <P as NodePrimitivesProvider>::Primitives,
 >;
 
-/// Represents a destination for writing data, either to database or static files.
+/// Represents a destination for writing data, either to database, static files, or RocksDB.
 #[derive(Debug, Display)]
 pub enum EitherWriter<'a, CURSOR, N> {
     /// Write to database table via cursor
     Database(CURSOR),
     /// Write to static file
     StaticFile(StaticFileProviderRWRefMut<'a, N>),
+    /// Write to RocksDB
+    RocksDB(&'a RocksDBProvider),
 }
 
 impl<'a> EitherWriter<'a, (), ()> {
+    /// Creates a new [`EitherWriter`] for transaction hash numbers based on storage settings.
+    ///
+    /// Routes to RocksDB if `transaction_hash_numbers_in_rocksdb` is enabled, otherwise to MDBX.
+    pub fn new_transaction_hash_numbers<P>(
+        provider: &'a P,
+    ) -> ProviderResult<EitherWriterTy<'a, P, tables::TransactionHashNumbers>>
+    where
+        P: DBProvider + NodePrimitivesProvider + StorageSettingsCache + RocksDBProviderFactory,
+        P::Tx: DbTxMut,
+    {
+        if provider.cached_storage_settings().transaction_hash_numbers_in_rocksdb {
+            return Ok(EitherWriter::RocksDB(provider.rocksdb_provider()));
+        }
+        Ok(EitherWriter::Database(
+            provider.tx_ref().cursor_write::<tables::TransactionHashNumbers>()?,
+        ))
+    }
+
     /// Creates a new [`EitherWriter`] for receipts based on storage settings and prune modes.
     pub fn new_receipts<P>(
         provider: &'a P,
@@ -89,6 +108,17 @@ impl<'a> EitherWriter<'a, (), ()> {
         }
     }
 
+    /// Returns the destination for transaction hash numbers based on storage settings.
+    pub fn transaction_hash_numbers_destination<P: DBProvider + StorageSettingsCache>(
+        provider: &P,
+    ) -> EitherWriterDestination {
+        if provider.cached_storage_settings().transaction_hash_numbers_in_rocksdb {
+            EitherWriterDestination::RocksDB
+        } else {
+            EitherWriterDestination::Database
+        }
+    }
+
     /// Creates a new [`EitherWriter`] for senders based on storage settings.
     pub fn new_senders<P>(
         provider: &'a P,
@@ -109,15 +139,16 @@ impl<'a> EitherWriter<'a, (), ()> {
             ))
         }
     }
+
 }
 
 impl<'a, CURSOR, N: NodePrimitives> EitherWriter<'a, CURSOR, N> {
     /// Increment the block number.
     ///
-    /// Relevant only for [`Self::StaticFile`]. It is a no-op for [`Self::Database`].
+    /// Relevant only for [`Self::StaticFile`]. It is a no-op for [`Self::Database`] and [`Self::RocksDB`].
     pub fn increment_block(&mut self, expected_block_number: BlockNumber) -> ProviderResult<()> {
         match self {
-            Self::Database(_) => Ok(()),
+            Self::Database(_) | Self::RocksDB(_) => Ok(()),
             Self::StaticFile(writer) => writer.increment_block(expected_block_number),
         }
     }
@@ -127,10 +158,10 @@ impl<'a, CURSOR, N: NodePrimitives> EitherWriter<'a, CURSOR, N> {
     /// If the writer is positioned at a greater block number than the specified one, the writer
     /// will NOT be unwound and the error will be returned.
     ///
-    /// Relevant only for [`Self::StaticFile`]. It is a no-op for [`Self::Database`].
+    /// Relevant only for [`Self::StaticFile`]. It is a no-op for [`Self::Database`] and [`Self::RocksDB`].
     pub fn ensure_at_block(&mut self, block_number: BlockNumber) -> ProviderResult<()> {
         match self {
-            Self::Database(_) => Ok(()),
+            Self::Database(_) | Self::RocksDB(_) => Ok(()),
             Self::StaticFile(writer) => writer.ensure_at_block(block_number),
         }
     }
@@ -146,6 +177,10 @@ where
         match self {
             Self::Database(cursor) => Ok(cursor.append(tx_num, receipt)?),
             Self::StaticFile(writer) => writer.append_receipt(tx_num, receipt),
+            Self::RocksDB(_) => {
+                // Receipts are not stored in RocksDB
+                Ok(())
+            }
         }
     }
 }
@@ -159,6 +194,8 @@ where
         match self {
             Self::Database(cursor) => Ok(cursor.append(tx_num, sender)?),
             Self::StaticFile(writer) => writer.append_transaction_sender(tx_num, sender),
+            // Transaction senders are not stored in RocksDB
+            Self::RocksDB(_) => Ok(())
         }
     }
 
@@ -175,6 +212,8 @@ where
                 Ok(())
             }
             Self::StaticFile(writer) => writer.append_transaction_senders(senders),
+            // Transaction senders are not stored in RocksDB
+            Self::RocksDB(_) => Ok(())
         }
     }
 
@@ -206,9 +245,138 @@ where
 
                 writer.prune_transaction_senders(to_delete, block)?;
             }
+            // RocksDB doesn't support transaction senders
+            Self::RocksDB(_) => {}
         }
 
         Ok(())
+    }
+}
+
+impl<'a, CURSOR, N: NodePrimitives> EitherWriter<'a, CURSOR, N>
+where
+    CURSOR: DbCursorRW<tables::TransactionHashNumbers>,
+{
+    /// Insert transaction hash number mappings in bulk.
+    ///
+    /// Unlike `append_transaction_hash_numbers`, this method uses insert operation
+    /// which can handle unsorted keys. Use this for transaction hashes within a block
+    /// where hashes are not naturally sorted.
+    ///
+    /// # Duplicate Key Behavior
+    ///
+    /// **Important**: This method has different behavior for duplicate keys depending
+    /// on the storage backend:
+    ///
+    /// - **MDBX (Database)**: `cursor.insert()` will **error** if the key already exists.
+    ///   This helps catch bugs during development and testing.
+    ///
+    /// - **RocksDB**: `batch.put()` will **silently overwrite** existing values.
+    ///   This provides better performance in production.
+    ///
+    /// ## Why This Difference is Safe
+    ///
+    /// Transaction hash numbers (`TransactionHashNumbers` table) serve as a lookup index
+    /// for RPC queries (e.g., `eth_getTransactionByHash`) and have these properties:
+    ///
+    /// 1. **Non-consensus-critical**: Not used for block validation or state execution
+    /// 2. **Reconstructable**: Can be rebuilt from blockchain data if corrupted
+    /// 3. **Cryptographically unique**: SHA256 transaction hashes have no collisions
+    /// 4. **Properly managed**: Chain reorgs delete old entries before re-inserting
+    ///
+    /// Therefore:
+    /// - In normal operation, duplicates never occur
+    /// - During reorgs, data is cleaned up before re-insertion
+    /// - If duplicates somehow occur (bugs/corruption), the impact is limited to
+    ///   RPC query responses, not chain processing
+    ///
+    /// The silent overwrite behavior in RocksDB provides better performance without
+    /// compromising safety for this read-only lookup table. The error behavior in MDBX
+    /// serves as a useful safety net during development.
+    pub fn insert_transaction_hash_numbers<I>(&mut self, mappings: I) -> ProviderResult<()>
+    where
+        I: Iterator<Item = (TxHash, TxNumber)>,
+    {
+        match self {
+            Self::Database(cursor) => {
+                for (tx_hash, tx_num) in mappings {
+                    cursor.insert(tx_hash, &tx_num)?;
+                }
+                Ok(())
+            }
+            Self::RocksDB(rocksdb) => {
+                rocksdb.write_batch(|batch| {
+                    for (tx_hash, tx_num) in mappings {
+                        batch.put::<tables::TransactionHashNumbers>(tx_hash, &tx_num)?;
+                    }
+                    Ok(())
+                })
+            }
+            Self::StaticFile(_) => {
+                // TransactionHashNumbers are not stored in static files
+                Ok(())
+            }
+        }
+    }
+
+    /// Delete transaction hash number mappings in bulk.
+    ///
+    /// This method uses batch deletion for efficient removal of multiple transaction hash mappings.
+    /// For RocksDB, it uses write batching for atomic bulk deletes.
+    pub fn delete_transaction_hash_numbers<I>(&mut self, hashes: I) -> ProviderResult<()>
+    where
+        I: Iterator<Item = TxHash>,
+        CURSOR: DbCursorRO<tables::TransactionHashNumbers>,
+    {
+        match self {
+            Self::Database(cursor) => {
+                for tx_hash in hashes {
+                    if cursor.seek_exact(tx_hash)?.is_some() {
+                        cursor.delete_current()?;
+                    }
+                }
+                Ok(())
+            }
+            Self::RocksDB(rocksdb) => {
+                rocksdb.write_batch(|batch| {
+                    for tx_hash in hashes {
+                        batch.delete::<tables::TransactionHashNumbers>(tx_hash)?;
+                    }
+                    Ok(())
+                })
+            }
+            Self::StaticFile(_) => {
+                // TransactionHashNumbers are not stored in static files
+                Ok(())
+            }
+        }
+    }
+
+    /// Append transaction hash number mappings in bulk.
+    pub fn append_transaction_hash_numbers<I>(&mut self, mappings: I) -> ProviderResult<()>
+    where
+        I: Iterator<Item = (TxHash, TxNumber)>,
+    {
+        match self {
+            Self::Database(cursor) => {
+                for (tx_hash, tx_num) in mappings {
+                    cursor.append(tx_hash, &tx_num)?;
+                }
+                Ok(())
+            }
+            Self::RocksDB(rocksdb) => {
+                rocksdb.write_batch(|batch| {
+                    for (tx_hash, tx_num) in mappings {
+                        batch.put::<tables::TransactionHashNumbers>(tx_hash, &tx_num)?;
+                    }
+                    Ok(())
+                })
+            }
+            Self::StaticFile(_) => {
+                // TransactionHashNumbers are not stored in static files
+                Ok(())
+            }
+        }
     }
 }
 
@@ -277,6 +445,8 @@ pub enum EitherWriterDestination {
     Database,
     /// Write to static file
     StaticFile,
+    /// Write to RocksDB
+    RocksDB,
 }
 
 impl EitherWriterDestination {

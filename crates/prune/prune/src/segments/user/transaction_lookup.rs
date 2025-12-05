@@ -1,12 +1,14 @@
 use crate::{
-    db_ext::DbTxPruneExt,
     segments::{PruneInput, Segment, SegmentOutput},
     PrunerError,
 };
 use alloy_eips::eip2718::Encodable2718;
 use rayon::prelude::*;
-use reth_db_api::{tables, transaction::DbTxMut};
-use reth_provider::{BlockReader, DBProvider, PruneCheckpointReader, StaticFileProviderFactory};
+use reth_db_api::transaction::DbTxMut;
+use reth_provider::{
+    BlockReader, DBProvider, EitherWriter, PruneCheckpointReader, RocksDBProviderFactory,
+    StaticFileProviderFactory, StorageSettingsCache, TransactionsProvider,
+};
 use reth_prune_types::{
     PruneCheckpoint, PruneMode, PrunePurpose, PruneSegment, SegmentOutputCheckpoint,
 };
@@ -29,7 +31,10 @@ where
     Provider: DBProvider<Tx: DbTxMut>
         + BlockReader<Transaction: Encodable2718>
         + PruneCheckpointReader
-        + StaticFileProviderFactory,
+        + StaticFileProviderFactory
+        + RocksDBProviderFactory
+        + StorageSettingsCache
+        + TransactionsProvider,
 {
     fn segment(&self) -> PruneSegment {
         PruneSegment::TransactionLookup
@@ -105,21 +110,23 @@ where
 
         let mut limiter = input.limiter;
 
-        let mut last_pruned_transaction = None;
-        let (pruned, done) =
-            provider.tx_ref().prune_table_with_iterator::<tables::TransactionHashNumbers>(
-                hashes,
-                &mut limiter,
-                |row| {
-                    last_pruned_transaction =
-                        Some(last_pruned_transaction.unwrap_or(row.1).max(row.1))
-                },
-            )?;
+        let mut tx_hash_writer = EitherWriter::new_transaction_hash_numbers(provider)?;
 
-        let done = done && tx_range_end == end;
+        // Calculate exact amount to prune based on limiter
+        let remaining_limit = limiter.deleted_entries_limit_left().unwrap_or(hashes.len());
+        let to_prune = remaining_limit.min(hashes.len());
+        let done = to_prune == hashes.len();
+
+        if to_prune > 0 {
+            tx_hash_writer.delete_transaction_hash_numbers(hashes[..to_prune].iter().copied())?;
+            limiter.increment_deleted_entries_count_by(to_prune);
+        }
+
+        let pruned = to_prune;
+        
+        let last_pruned_transaction = start + pruned as u64 - 1;
+        let done = done && last_pruned_transaction == tx_range_end;
         trace!(target: "pruner", %pruned, %done, "Pruned transaction lookup");
-
-        let last_pruned_transaction = last_pruned_transaction.unwrap_or(tx_range_end);
 
         let last_pruned_block = provider
             .block_by_transaction_id(last_pruned_transaction)?

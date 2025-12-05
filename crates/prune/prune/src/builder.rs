@@ -5,9 +5,7 @@ use reth_db_api::{table::Value, transaction::DbTxMut};
 use reth_exex_types::FinishedExExHeight;
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
-    providers::StaticFileProvider, BlockReader, ChainStateBlockReader, DBProvider,
-    DatabaseProviderFactory, NodePrimitivesProvider, PruneCheckpointReader, PruneCheckpointWriter,
-    StaticFileProviderFactory, StorageSettingsCache,
+    BlockReader, ChainStateBlockReader, DBProvider, DatabaseProviderFactory, NodePrimitivesProvider, PruneCheckpointReader, PruneCheckpointWriter, RocksDBProviderFactory, StaticFileProviderFactory, StorageSettingsCache, providers::StaticFileProvider
 };
 use reth_prune_types::PruneModes;
 use std::time::Duration;
@@ -81,6 +79,7 @@ impl PrunerBuilder {
                                 + BlockReader<Transaction: Encodable2718>
                                 + ChainStateBlockReader
                                 + StorageSettingsCache
+                                + RocksDBProviderFactory
                                 + StaticFileProviderFactory<
                     Primitives: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>,
                 >,
@@ -114,7 +113,8 @@ impl PrunerBuilder {
             + ChainStateBlockReader
             + PruneCheckpointWriter
             + PruneCheckpointReader
-            + StorageSettingsCache,
+            + StorageSettingsCache
+            + RocksDBProviderFactory,
     {
         let segments = SegmentSet::<Provider>::from_components(static_file_provider, self.segments);
 
