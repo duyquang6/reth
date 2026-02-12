@@ -159,17 +159,27 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
     pub(crate) fn finalize(&self) -> ProviderResult<()> {
         debug!(target: "provider::static_file", "Finalizing all static file segments into disk");
 
-        for writer_lock in [
-            &self.headers,
-            &self.transactions,
-            &self.receipts,
-            &self.transaction_senders,
-            &self.account_change_sets,
-            &self.storage_change_sets,
-        ] {
+        let segments = [
+            (StaticFileSegment::Headers, &self.headers),
+            (StaticFileSegment::Transactions, &self.transactions),
+            (StaticFileSegment::Receipts, &self.receipts),
+            (StaticFileSegment::TransactionSenders, &self.transaction_senders),
+            (StaticFileSegment::AccountChangeSets, &self.account_change_sets),
+            (StaticFileSegment::StorageChangeSets, &self.storage_change_sets),
+        ];
+
+        for (segment, writer_lock) in segments {
+            let start = Instant::now();
             let mut writer = writer_lock.write();
             if let Some(writer) = writer.as_mut() {
                 writer.finalize()?;
+                if let Some(metrics) = &writer.metrics {
+                    metrics.record_segment_operation(
+                        segment,
+                        StaticFileProviderOperation::Finalize,
+                        Some(start.elapsed()),
+                    );
+                }
             }
         }
 

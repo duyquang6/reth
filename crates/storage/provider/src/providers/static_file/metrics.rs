@@ -114,6 +114,7 @@ pub(crate) enum StaticFileProviderOperation {
     Prune,
     IncrementBlock,
     CommitWriter,
+    Finalize,
 }
 
 impl StaticFileProviderOperation {
@@ -125,6 +126,7 @@ impl StaticFileProviderOperation {
             Self::Prune => "prune",
             Self::IncrementBlock => "increment-block",
             Self::CommitWriter => "commit-writer",
+            Self::Finalize => "finalize",
         }
     }
 }
